@@ -76,26 +76,21 @@ def load_model_tokenizer_config(
         config.return_dict_in_generate = True
         config.output_attentions = True
 
+    # Convert string dtype to torch.dtype if necessary
+    if isinstance(dtype, str):
+        # Handle both "float16" and "torch.float16" style strings
+        dtype_str = dtype.replace("torch.", "")
+        if not hasattr(torch, dtype_str):
+            raise ValueError(
+                f"Invalid dtype string: {dtype}. Expected torch dtype like 'float16', 'float32', 'bfloat16', etc."
+            )
+        dtype = getattr(torch, dtype_str)
+
+    # Set dtype at load time; a dispatched (device_map="auto") model can't be moved with .to()
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, config=config, device_map="auto"
+        model_name, config=config, dtype=dtype, device_map="auto"
     )
     model = model.eval()
-    if dtype is not None:
-        # Convert string dtype to torch.dtype if necessary
-        if isinstance(dtype, str):
-            # Handle both "float16" and "torch.float16" style strings
-            dtype_str = (
-                dtype.replace("torch.", "") if dtype.startswith("torch.") else dtype
-            )
-            if hasattr(torch, dtype_str):
-                dtype = getattr(torch, dtype_str)
-            else:
-                raise ValueError(
-                    f"Invalid dtype string: {dtype}. Expected torch dtype like 'float16', 'float32', 'bfloat16', etc."
-                )
-        model = model.to(dtype=dtype, device=device)  # type: ignore
-    else:
-        model = model.to(device)  # type: ignore
 
     return model, tokenizer, config
 
