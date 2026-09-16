@@ -157,9 +157,11 @@ def temporary_hooks(
     module_dict: ModuleDict,
     hook_specs_dict: dict[str, Iterable[HookSpecPre | HookSpecPost]],
     early_exit: bool = False,
+    hookloc_resolver: Callable = layer_component_to_hookloc,
 ):
     """
     Register forward hooks temporarily and remove them on exit.
+    hookloc_resolver maps (layer, component) to a named module for capture and early exit.
 
     Hook function contract:
       fn(output, module_name, module) -> None or modified_output
@@ -171,7 +173,7 @@ def temporary_hooks(
         for hook_type, hook_specs in hook_specs_dict.items():
             for spec in hook_specs:
                 layer_component = spec.layer_component
-                module_name = layer_component_to_hookloc(layer_component)
+                module_name = hookloc_resolver(layer_component)
 
                 if module_name not in module_dict:
                     raise ValueError(f"Module {module_name!r} not found in model.")
@@ -231,7 +233,7 @@ def temporary_hooks(
             if last_layer_of_interest is None:
                 raise ValueError("Early exit requires at least one forward hook target")
 
-            stop_at_module = layer_component_to_hookloc((last_layer_of_interest, "layer_out"))
+            stop_at_module = hookloc_resolver((last_layer_of_interest, "layer_out"))
             module = module_dict[stop_at_module]
 
             def stop_execution_hook(module: nn.Module, *args, **kwargs):

@@ -1,6 +1,6 @@
 """Inference-only expressed-distress wording dataset and separate CSV."""
 from . import inference_projection
-from .corpora.severity_wording_prompts import build_prompt_records
+from .corpora.inference.severity_wording_prompts import build_prompt_records
 
 CSV_COLUMNS = ['task', 'prompt', 'arc_length_parallel', 'arc_length_orthogonal']
 

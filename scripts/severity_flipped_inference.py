@@ -1,6 +1,6 @@
 """Inference-only flipped-severity dataset with isolated caches and CSV."""
 from . import inference_projection
-from .corpora.severity_flipped_prompts import build_prompt_records
+from .corpora.inference.severity_flipped_prompts import build_prompt_records
 
 CSV_COLUMNS = ['template', 'severity_word', 'arc_length_parallel', 'arc_length_orthogonal']
 

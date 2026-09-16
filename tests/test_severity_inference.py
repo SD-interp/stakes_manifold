@@ -14,12 +14,14 @@ import numpy as np
 import pandas as pd
 import torch
 
-from scripts import (cache_activations, severity_flipped_inference, severity_inference,
+from scripts import (cache_activations, context_inference, severity_flipped_inference,
+                     severity_inference,
                      severity_pairwise_inference, severity_wording_inference)
-from scripts.corpora import (severity_flipped_prompts, severity_pairwise_prompts,
+from scripts.corpora.inference import (context_prompts, severity_flipped_prompts,
+                            severity_pairwise_prompts,
                             severity_wording_prompts)
 from scripts.cache_inventory import CacheInventory
-from scripts.corpora.severity_prompts import TEMPLATES, build_prompt_records
+from scripts.corpora.inference.severity_prompts import TEMPLATES, build_prompt_records
 from scripts.pipeline_config import RunConfig, NO_TIME_CORPORA
 from scripts.stakes_height_slices import SliceConfig, SliceSurface
 from scripts.stakes_surface_bundle import load_surface_bundle
@@ -50,7 +52,7 @@ class SeverityTests(unittest.TestCase):
         active = []
 
         @contextmanager
-        def hooks(modules, specs, early_exit):
+        def hooks(modules, specs, early_exit, hookloc_resolver=None):
             active.append(specs['fwd'][0])
             try:
                 yield
@@ -75,8 +77,14 @@ class SeverityTests(unittest.TestCase):
             yield loader, tokenize
 
     def test_dataset_and_notebook(self):
-        self.assertEqual(len(TEMPLATES), 20)
+        self.assertEqual(len(TEMPLATES), 35)
         self.assertEqual(len(self.records), sum(len(t[3]) for t in TEMPLATES))
+        self.assertEqual(len(self.records), 171)
+        for _, _, template, values in TEMPLATES:
+            fields = [field for _, field, _, _ in Formatter().parse(template)
+                      if field is not None]
+            self.assertEqual(len(fields), 1)
+            self.assertEqual(len(values), len(set(values)))
         self.assertEqual(len({r['text'] for r in self.records}), len(self.records))
         for record in self.records:
             self.assertNotIn('stakes', record['task_metadata'])
@@ -91,25 +99,109 @@ class SeverityTests(unittest.TestCase):
         self.assertLess(code.index('severity_inference.run('), code.index('severity_flipped_inference.run('))
         self.assertLess(code.index('severity_flipped_inference.run('), code.index('severity_pairwise_inference.run('))
         self.assertLess(code.index('severity_pairwise_inference.run('), code.index('severity_wording_inference.run('))
+        self.assertLess(code.index('severity_wording_inference.run('), code.index('context_inference.run('))
+
+    def test_context_dataset_has_matched_editable_contexts(self):
+        groups = context_prompts.TASK_GROUPS
+        records = context_prompts.build_prompt_records()
+        self.assertEqual(len(groups), 5)
+        self.assertEqual(len(records), 40)
+        self.assertEqual(len({record['text'] for record in records}), 40)
+        for group in groups:
+            rows = [record for record in records if record['task'] == group['id']]
+            self.assertEqual([row['task_metadata']['context'] for row in rows],
+                             list(context_prompts.CONTEXT_ORDER) * 2)
+            self.assertEqual([row['text'] for row in rows], list(group['prompts'].values()) + list(group['after_prompts'].values()))
+            self.assertEqual(len({row['template_metadata']['core_request'] for row in rows}), 1)
+            self.assertEqual([row['task_metadata']['context_position'] for row in rows],
+                             ['before'] * 4 + ['after'] * 4)
+            for before, after in zip(rows[:4], rows[4:]):
+                framing, _, scenario = before['text'].partition('. ')
+                self.assertEqual(after['text'], scenario + ' ' + framing + '.')
+            for row in rows:
+                self.assertEqual(row['task_metadata']['usage'], 'inference_only')
+                self.assertNotIn('stakes', row['task_metadata'])
+                self.assertNotIn('expected_direction', row['task_metadata'])
+                for field in ('base_value', 'base_unit', 'unit_variant', 'number_format',
+                              'value', 'value_text', 'unit'):
+                    self.assertIsNone(row[field])
+
+        changed = copy.deepcopy(groups)
+        changed[0]['prompts']['video_game'] += ' Nobody can be harmed.'
+        with patch.object(context_prompts, 'TASK_GROUPS', changed):
+            with self.assertRaisesRegex(ValueError, 'scenario differs'):
+                context_prompts.build_prompt_records()
+
+        changed = copy.deepcopy(groups)
+        changed[0]['after_prompts']['video_game'] += ' Nobody can be harmed.'
+        with patch.object(context_prompts, 'TASK_GROUPS', changed):
+            with self.assertRaisesRegex(ValueError, 'only move the context sentence'):
+                context_prompts.build_prompt_records()
+
+    def test_context_inference_is_isolated_reusable_and_aligned(self):
+        before = {path.name: path.read_bytes() for path in self.config.surface_dir.iterdir()}
+        records = context_prompts.build_prompt_records()
+        directory = self.config.run_dir / 'inference' / 'context'
+        with self.mock_model() as (loader, tokenize):
+            csv, result, diagnostics = context_inference.run(self.config)
+            self.assertEqual(loader.call_count, 1)
+            cache_times = {path: path.stat().st_mtime_ns
+                           for path in (directory / 'activations').glob('*.pt')}
+            self.assertEqual(len(cache_times), 5)
+            self.assertTrue(all(path.name.startswith('context_inference--')
+                                for path in cache_times))
+            loader.reset_mock()
+            context_inference.run(self.config)
+            loader.assert_not_called()
+            self.assertEqual(cache_times, {path: path.stat().st_mtime_ns
+                                           for path in cache_times})
+
+        self.assertEqual(before, {path.name: path.read_bytes()
+                                  for path in self.config.surface_dir.iterdir()})
+        self.assertEqual(csv, directory / 'context_arc_lengths.csv')
+        self.assertEqual(list(pd.read_csv(csv).columns), context_inference.CSV_COLUMNS)
+        self.assertEqual(result.task.tolist(), [record['task'] for record in records])
+        self.assertEqual(result.context.tolist(),
+                         [record['task_metadata']['context'] for record in records])
+        self.assertEqual(result.context_position.tolist(),
+                         [record['task_metadata']['context_position'] for record in records])
+        self.assertEqual(result.prompt.tolist(), [record['text'] for record in records])
+        arrays, _, coordinates = load_surface_bundle(self.config.surface_dir)
+        X = tokenize([record['text'] for record in records])['input_ids'].float().double().numpy()
+        expected = coordinates.map_points(
+            ((X - arrays['pls_mean']) @ arrays['pls_rotations'])[:, :3],
+            progress_seconds=None,
+        )
+        for column in context_inference.CSV_COLUMNS[-2:]:
+            np.testing.assert_allclose(result[column], expected[column])
+        paths = sorted(cache_times, reverse=True)
+        reordered, _ = context_inference.project_caches(self.config, records, paths)
+        pd.testing.assert_frame_equal(result, reordered)
+        with self.assertRaisesRegex(ValueError, 'Missing'):
+            context_inference.project_caches(self.config, records, paths[:-1])
+        fitting_cache_paths = (list(self.config.activations_dir.rglob('*.pt'))
+                               if self.config.activations_dir.exists() else [])
+        self.assertTrue(all('context' not in path.name for path in fitting_cache_paths))
 
     def test_flipped_dataset_preserves_reference_contract(self):
         reference = {template[0]: template for template in TEMPLATES}
         flipped = {template[0]: template for template in severity_flipped_prompts.TEMPLATES}
-        omitted = {entry['reference_template_id']
-                   for entry in severity_flipped_prompts.OMITTED_FAMILIES}
-        self.assertEqual(set(flipped) | omitted, set(reference))
-        self.assertFalse(set(flipped) & omitted)
         self.assertEqual(len(flipped), 20)
-        self.assertFalse(omitted)
+        self.assertLess(set(flipped), set(reference))
+        self.assertEqual([template[0] for template in severity_flipped_prompts.TEMPLATES],
+                         [template[0] for template in TEMPLATES[:20]])
 
         records = severity_flipped_prompts.build_prompt_records()
-        self.assertEqual(len(records), len(self.records))
+        self.assertEqual(len(records),
+                         sum(len(t[3]) for t in severity_flipped_prompts.TEMPLATES))
+        self.assertEqual(len(records), 111)
         self.assertEqual(len({record['text'] for record in records}), len(records))
+        reference_texts = {record['text'] for record in self.records}
         for template_id, (_, domain, template, values) in flipped.items():
-            _, reference_domain, _, reference_values = reference[template_id]
-            reference_template = reference[template_id][2]
+            _, reference_domain, reference_template, reference_values = reference[template_id]
             self.assertEqual(domain, reference_domain)
             self.assertEqual(values, reference_values)
+            self.assertNotEqual(template, reference_template)
             reference_fields = [field for _, field, _, _ in Formatter().parse(reference_template)
                                 if field is not None]
             flipped_fields = [field for _, field, _, _ in Formatter().parse(template)
@@ -120,51 +212,68 @@ class SeverityTests(unittest.TestCase):
             for row in rows:
                 self.assertNotIn('{', row['text'])
                 self.assertNotIn('}', row['text'])
+                self.assertNotIn(row['text'], reference_texts)
+                self.assertEqual(row['task'], template_id)
                 self.assertNotIn('stakes', row['task_metadata'])
-                self.assertEqual(row['template_metadata'], {
-                    'template': template,
-                    'domain': domain,
-                    'reference_template_id': template_id,
-                    'flip_strategy': 'resolved_from_fixed_incident',
-                    'expected_direction': 'decreasing_in_reference_order',
-                })
+                self.assertEqual(row['task_metadata']['usage'], 'inference_only')
+                self.assertEqual(row['template_metadata'],
+                                 {'template': template, 'domain': domain})
                 for field in ('base_value', 'base_unit', 'unit_variant', 'number_format',
                               'value', 'value_text', 'unit'):
                     self.assertIsNone(row[field])
 
-    def test_pairwise_dataset_has_one_reference_ordered_pair_per_family(self):
+        changed = [list(template) for template in severity_flipped_prompts.TEMPLATES]
+        changed[0][3] = list(changed[0][3]) + [changed[0][3][0]]
+        with patch.object(severity_flipped_prompts, 'TEMPLATES',
+                          [tuple(template) for template in changed]):
+            with self.assertRaisesRegex(ValueError, 'Duplicate'):
+                severity_flipped_prompts.build_prompt_records()
+
+    def test_pairwise_dataset_contrasts_low_and_high_severity_fillers(self):
         reference = {template[0]: template for template in TEMPLATES}
         pairwise = {template[0]: template for template in severity_pairwise_prompts.TEMPLATES}
-        omitted = {entry['reference_template_id']
-                   for entry in severity_pairwise_prompts.OMITTED_FAMILIES}
-        self.assertEqual(set(pairwise) | omitted, set(reference))
-        self.assertFalse(set(pairwise) & omitted)
-        self.assertEqual(len(pairwise), 20)
-        self.assertFalse(omitted)
+        self.assertEqual(len(pairwise), 15)
+        # Each pair names the reference family it contrasts, and introduces its own ID.
+        self.assertTrue({template[2] for template in severity_pairwise_prompts.TEMPLATES}
+                        <= set(reference))
+        self.assertFalse(set(pairwise) & set(reference))
 
         records = severity_pairwise_prompts.build_prompt_records()
-        self.assertEqual(len(records), 40)
-        self.assertEqual(len({record['text'] for record in records}), 40)
-        for template_id, (_, domain, template, pair) in pairwise.items():
-            _, reference_domain, reference_template, reference_values = reference[template_id]
-            self.assertEqual(domain, reference_domain)
-            self.assertEqual(len(pair), 2)
-            self.assertTrue(all(value in reference_values for value in pair))
-            self.assertLess(reference_values.index(pair[0]), reference_values.index(pair[1]))
-            reference_fields = [field for _, field, _, _ in Formatter().parse(reference_template)
-                                if field is not None]
-            pairwise_fields = [field for _, field, _, _ in Formatter().parse(template)
-                               if field is not None]
-            self.assertEqual(pairwise_fields, reference_fields)
+        self.assertEqual(len(records), 30)
+        self.assertEqual(len({record['text'] for record in records}), len(records))
+        reference_texts = {record['text'] for record in self.records}
+        for template_id, (_, domain, family, template, low, high) in pairwise.items():
+            # Pairs carry their own domain label, independent of the family's.
+            self.assertTrue(domain)
+            fields = [field for _, field, _, _ in Formatter().parse(template)
+                      if field is not None]
+            self.assertEqual(len(fields), 1)
             rows = [record for record in records if record['template_id'] == template_id]
-            self.assertEqual([row['task_metadata']['severity_word'] for row in rows], pair)
+            self.assertEqual([row['task_metadata']['severity_word'] for row in rows],
+                             [low, high])
+            self.assertEqual([row['task_metadata']['severity_pole'] for row in rows],
+                             ['low', 'high'])
             for row in rows:
+                self.assertNotIn('{', row['text'])
+                self.assertNotIn('}', row['text'])
+                self.assertEqual(row['task'], template_id)
+                self.assertEqual(row['task_metadata']['family'], family)
                 self.assertNotIn('stakes', row['task_metadata'])
-                self.assertEqual(row['template_metadata']['reference_pair'], pair)
-                self.assertEqual(row['template_metadata']['flip_strategy'],
-                                 'resolved_from_fixed_pair')
-                self.assertEqual(row['template_metadata']['expected_direction'],
-                                 'decreasing_in_reference_order')
+                self.assertEqual(row['task_metadata']['usage'], 'inference_only')
+                self.assertEqual(row['template_metadata'],
+                                 {'template': template, 'domain': domain})
+                for field in ('base_value', 'base_unit', 'unit_variant', 'number_format',
+                              'value', 'value_text', 'unit'):
+                    self.assertIsNone(row[field])
+
+        # The pairs are restated in declarative form; they must not collide with the
+        # reference corpus.
+        self.assertFalse({record['text'] for record in records} & reference_texts)
+
+        changed = [tuple(template) for template in severity_pairwise_prompts.TEMPLATES][:-1]
+        with patch.object(severity_pairwise_prompts, 'TEMPLATES', changed):
+            with self.assertRaisesRegex(ValueError, '15 uniquely identified'):
+                severity_pairwise_prompts.build_prompt_records()
 
     def test_wording_dataset_and_independent_variant_lists(self):
         groups = severity_wording_prompts.TASK_GROUPS
@@ -222,7 +331,7 @@ class SeverityTests(unittest.TestCase):
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.config.surface_dir.iterdir()})
         self.assertEqual(list(pd.read_csv(csv).columns), severity_wording_inference.CSV_COLUMNS)
         self.assertEqual(list(pd.read_csv(original_csv).columns), severity_inference.CSV_COLUMNS)
-        self.assertEqual(len(original), 111)
+        self.assertEqual(len(original), len(self.records))
         self.assertEqual(len(result), 160)
         self.assertEqual(result.task.tolist(), [r['task'] for r in records])
         self.assertEqual(result.prompt.tolist(), [r['text'] for r in records])
@@ -267,7 +376,7 @@ class SeverityTests(unittest.TestCase):
                                   for path in self.config.surface_dir.iterdir()})
 
         paths = sorted((directory / 'activations').glob('*.pt'), reverse=True)
-        self.assertEqual(len(paths), 20)
+        self.assertEqual(len(paths), len(severity_flipped_prompts.TEMPLATES))
         self.assertTrue(all(path.name.startswith('severity_flipped_inference--')
                             for path in paths))
         reordered, _ = severity_flipped_inference.project_caches(
@@ -318,7 +427,8 @@ class SeverityTests(unittest.TestCase):
             loader.assert_not_called()
         self.assertEqual(csv.name, 'severity_pairwise_arc_lengths.csv')
         self.assertEqual(list(pd.read_csv(csv).columns), severity_pairwise_inference.CSV_COLUMNS)
-        self.assertEqual(len(result), 40)
+        self.assertEqual(len(result), len(records))
+        self.assertEqual(len(result), 30)
         self.assertEqual(result.severity_word.tolist(),
                          [record['task_metadata']['severity_word'] for record in records])
         self.assertTrue(diagnostics.outside_saved_height_range.any())
@@ -326,7 +436,7 @@ class SeverityTests(unittest.TestCase):
                                   for path in self.config.surface_dir.iterdir()})
 
         paths = sorted((directory / 'activations').glob('*.pt'), reverse=True)
-        self.assertEqual(len(paths), 20)
+        self.assertEqual(len(paths), len(severity_pairwise_prompts.TEMPLATES))
         self.assertTrue(all(path.name.startswith('severity_pairwise_inference--')
                             for path in paths))
         reordered, _ = severity_pairwise_inference.project_caches(self.config, records, paths)

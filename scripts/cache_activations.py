@@ -47,6 +47,24 @@ def activation_dtype(device):
 
 def load_model(config):
     """Load the model and chat tokenizer with the settings every cache records."""
+    if config.naming_convention == "gemma4":
+        import torch
+        from transformers import AutoModelForMultimodalLM, AutoTokenizer
+        from utils.mech_interp_toolkit.utils import ChatTemplateTokenizer
+
+        device = resolve_device(config)
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model_name, use_fast=True, padding_side="left"
+        )
+        tokenizer = ChatTemplateTokenizer(tokenizer, system_prompt="")
+        model = AutoModelForMultimodalLM.from_pretrained(
+            config.model_name,
+            dtype=getattr(torch, activation_dtype(device)),
+            device_map="auto",
+            attn_implementation="sdpa",
+        ).eval()
+        return model, tokenizer
+
     from utils.mech_interp_toolkit.utils import load_model_tokenizer_config
 
     device = resolve_device(config)
@@ -131,6 +149,11 @@ def _run(config, datasets, destination, model, tokenizer, force):
         add_generation_prompt=True,
         cache_schema_version=CACHE_SCHEMA_VERSION,
     )
+    # Preserve existing Llama cache fingerprints; other conventions must not
+    # reuse activations captured with a different module path.
+    if config.naming_convention != "llama":
+        cache_config.update(naming_convention=config.naming_convention,
+                            layer_module_name=config.layer_module_name)
     Path(destination).mkdir(parents=True, exist_ok=True)
     paths = []
     for dataset, records in datasets.items():
@@ -182,7 +205,8 @@ def _run(config, datasets, destination, model, tokenizer, force):
                 with (
                     torch.inference_mode(),
                     temporary_hooks(
-                        dict(model.named_modules()), {"fwd": [spec]}, early_exit=True
+                        dict(model.named_modules()), {"fwd": [spec]}, early_exit=True,
+                        hookloc_resolver=lambda _: config.layer_module_name,
                     ),
                 ):
                     model(**inputs, use_cache=False)

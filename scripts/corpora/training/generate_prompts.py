@@ -34,7 +34,7 @@ except ImportError:
     import impersonal_task_prompts as impersonal_task_prompts_dataset  # type: ignore
     import expert_task_prompts as expert_task_prompts_dataset  # type: ignore
 
-    from scripts.corpora.time_units import (  # type: ignore
+    from scripts.corpora.training.time_units import (  # type: ignore
         NUMBER_FORMATS,
         NumberFormat,
         UnitVariant,

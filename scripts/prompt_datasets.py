@@ -4,7 +4,7 @@ import json
 import random
 
 from .corpora import DATASETS, generate_task_dataset
-from .corpora import horizon_free_task_set
+from .corpora.training import horizon_free_task_set
 from .pipeline_config import NO_TIME_CORPORA, REGISTERS, SEED
 
 EXPECTED_MIN_TASKS = 350

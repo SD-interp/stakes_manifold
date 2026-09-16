@@ -1,6 +1,6 @@
 """Inference-only curated pairwise severity flips with isolated outputs."""
 from . import inference_projection
-from .corpora.severity_pairwise_prompts import build_prompt_records
+from .corpora.inference.severity_pairwise_prompts import build_prompt_records
 
 CSV_COLUMNS = ['template', 'severity_word', 'arc_length_parallel', 'arc_length_orthogonal']
 

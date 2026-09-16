@@ -47,7 +47,8 @@ All logic is in `scripts/`; the notebook only orchestrates.
 | `stakes_surface_pipeline.py` | stage-by-stage fitting, mapping, export, and plots |
 | `stakes_height_slices.py` | height-slice surface geometry and validation |
 | `stakes_surface_bundle.py` | centroid splines and loading saved bundles |
-| `corpora/` | prompt templates and task sets |
+| `corpora/training/` | prompt templates and task sets the manifold is fitted on |
+| `corpora/inference/` | self-contained inference-only evaluation datasets |
 
 Caching uses left padding, an empty system prompt, thinking disabled, and a generation
 prefix, via the loader, chat tokenizer, and temporary hooks in `utils/mech_interp_toolkit`
@@ -56,7 +57,7 @@ prefix, via the loader, chat tokenizer, and temporary hooks in `utils/mech_inter
 ## Severity inference
 
 The final notebook section generates 20 templates with editable substitution lists in
-`scripts/corpora/severity_prompts.py`. These prompts have no severity labels and never
+`scripts/corpora/inference/severity_prompts.py`. These prompts have no severity labels and never
 enter fitting or slice-grid construction. After surface export, it caches their
 activations and applies the frozen PLS transform and saved slice mapper.
 
@@ -72,7 +73,7 @@ diagnostics, including prompts outside saved height coverage, which snap to the 
 saved slice. `arc_length_orthogonal` retains its legacy meaning of snapped PLS3 height.
 
 The next notebook section runs the counterfactual dataset in
-`scripts/corpora/severity_flipped_prompts.py`. It preserves all 20 reference families,
+`scripts/corpora/inference/severity_flipped_prompts.py`. It preserves all 20 reference families,
 domains, slot values, and their original row order. In each fixed compound incident, the
 substituted harm is the only one successfully mitigated and all other harms remain
 unresolved. The expected residual-stakes direction is therefore decreasing across the
@@ -87,7 +88,7 @@ nor fitting caches can be reused accidentally. Projection uses the frozen saved 
 these prompts never contribute to fitting or slice coverage.
 
 The pairwise counterfactual dataset in
-`scripts/corpora/severity_pairwise_prompts.py` selects one curated pair from each of the
+`scripts/corpora/inference/severity_pairwise_prompts.py` selects one curated pair from each of the
 20 reference families (40 prompts total). Both members of a pair appear in the same fixed
 incident, and the substituted member is the only harm resolved. This predicts a local
 decrease across the two reference-ordered rows without claiming an exact reversal of the
@@ -101,12 +102,23 @@ severity datasets, and projection uses the frozen saved bundle without entering 
 
 The following notebook section runs a wording-based dataset: 20 fixed tasks
 with eight initial variants each (160 prompts), defined in
-`scripts/corpora/severity_wording_prompts.py`. Each group's `variants` list is independent
+`scripts/corpora/inference/severity_wording_prompts.py`. Each group's `variants` list is independent
 and can be edited or extended without changing other groups. These are expressions of
 distress and requests for help, without severity labels or calibrated rankings.
 
 Its outputs are isolated under `artifacts/<model name>/inference/severity_wording/`,
 including `prompts.json`, `activations/`, and `severity_wording_arc_lengths.csv`.
 The CSV columns are `task`, `prompt`, `arc_length_parallel`, and `arc_length_orthogonal`.
-All four datasets share frozen projection and export logic in `scripts/inference_projection.py`;
+The context-variation dataset in `scripts/corpora/inference/context_prompts.py` presents 20 new
+tasks in four matched settings, ordered as real life, video game, fictional story, and
+training simulation (80 prompts total). Within each task the core request is copied
+verbatim; only the explicitly identified setting changes. The prompts carry no severity
+rank or expected coordinate ordering.
+
+Its outputs are isolated under `artifacts/<model name>/inference/context/`, including
+`prompts.json`, `activations/`, and `context_arc_lengths.csv`. The CSV columns are
+`task`, `context`, `prompt`, `arc_length_parallel`, and `arc_length_orthogonal`, and the
+activation namespace is `context_inference`.
+
+All five datasets share frozen projection and export logic in `scripts/inference_projection.py`;
 none contributes to fitting or slice coverage, and each reuses only its own caches.

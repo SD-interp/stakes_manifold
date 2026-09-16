@@ -1,17 +1,19 @@
-"""Horizon-free prompt corpora: prompts that never state a time horizon.
+"""Prompt corpora, split by the role a corpus plays in the pipeline.
 
-`base_task_set` is not a corpus here; it supplies the task metadata
-schema and base task set that `horizon_free_task_set` builds on. Note the names of the
-two original corpora are historical and describe the opposite of their contents:
+`training/` holds the horizon-free corpora that are generated, cached, and fitted
+on: the task metadata schema (`base_task_set`), the task set built on it
+(`horizon_free_task_set`), the register modules, and the generator that crosses
+them (`generate_prompts`). They import one another freely.
 
-    conversational_no_time -> bare prompts, 3 templates  ("Task: X\n\nWrite a plan.")
-    task_only              -> conversational prompts, 12 templates
-                              ("Could you help me plan how to X?")
+`inference/` holds the inference-only evaluation corpora (severity, its flipped,
+pairwise, and wording variants, and the context variations). Each of those is
+self-contained and exposes the same `build_prompt_records` interface, so nothing
+in `training/` is needed to project them onto an already-fitted manifold.
 
-`scripts.pipeline_config.REGISTERS` maps each to the register label used in the analysis, so
-downstream code never has to rely on the filenames.
+The generator entry points stay re-exported here so downstream code can keep
+importing `scripts.corpora` without knowing which subpackage a corpus lives in.
 """
 
-from scripts.corpora.generate_prompts import DATASETS, generate_task_dataset
+from scripts.corpora.training import DATASETS, generate_task_dataset
 
 __all__ = ["DATASETS", "generate_task_dataset"]

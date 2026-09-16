@@ -1,6 +1,6 @@
 """Inference-only slot-substitution severity dataset (stable public interface)."""
 from . import inference_projection
-from .corpora.severity_prompts import build_prompt_records
+from .corpora.inference.severity_prompts import build_prompt_records
 
 CSV_COLUMNS = ['template', 'severity_word', 'arc_length_parallel', 'arc_length_orthogonal']
 
