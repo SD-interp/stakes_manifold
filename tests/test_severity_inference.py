@@ -4,6 +4,7 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
+from string import Formatter
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -13,8 +14,10 @@ import numpy as np
 import pandas as pd
 import torch
 
-from scripts import cache_activations, severity_inference, severity_wording_inference
-from scripts.corpora import severity_wording_prompts
+from scripts import (cache_activations, severity_flipped_inference, severity_inference,
+                     severity_pairwise_inference, severity_wording_inference)
+from scripts.corpora import (severity_flipped_prompts, severity_pairwise_prompts,
+                            severity_wording_prompts)
 from scripts.cache_inventory import CacheInventory
 from scripts.corpora.severity_prompts import TEMPLATES, build_prompt_records
 from scripts.pipeline_config import RunConfig, NO_TIME_CORPORA
@@ -85,7 +88,83 @@ class SeverityTests(unittest.TestCase):
                 compile(''.join(cell['source']), f'cell-{i}', 'exec')
         code = '\n'.join(''.join(c['source']) for c in nb['cells'])
         self.assertLess(code.index('pipeline.export('), code.index('severity_inference.run('))
-        self.assertLess(code.index('severity_inference.run('), code.index('severity_wording_inference.run('))
+        self.assertLess(code.index('severity_inference.run('), code.index('severity_flipped_inference.run('))
+        self.assertLess(code.index('severity_flipped_inference.run('), code.index('severity_pairwise_inference.run('))
+        self.assertLess(code.index('severity_pairwise_inference.run('), code.index('severity_wording_inference.run('))
+
+    def test_flipped_dataset_preserves_reference_contract(self):
+        reference = {template[0]: template for template in TEMPLATES}
+        flipped = {template[0]: template for template in severity_flipped_prompts.TEMPLATES}
+        omitted = {entry['reference_template_id']
+                   for entry in severity_flipped_prompts.OMITTED_FAMILIES}
+        self.assertEqual(set(flipped) | omitted, set(reference))
+        self.assertFalse(set(flipped) & omitted)
+        self.assertEqual(len(flipped), 20)
+        self.assertFalse(omitted)
+
+        records = severity_flipped_prompts.build_prompt_records()
+        self.assertEqual(len(records), len(self.records))
+        self.assertEqual(len({record['text'] for record in records}), len(records))
+        for template_id, (_, domain, template, values) in flipped.items():
+            _, reference_domain, _, reference_values = reference[template_id]
+            reference_template = reference[template_id][2]
+            self.assertEqual(domain, reference_domain)
+            self.assertEqual(values, reference_values)
+            reference_fields = [field for _, field, _, _ in Formatter().parse(reference_template)
+                                if field is not None]
+            flipped_fields = [field for _, field, _, _ in Formatter().parse(template)
+                              if field is not None]
+            self.assertEqual(flipped_fields, reference_fields)
+            rows = [record for record in records if record['template_id'] == template_id]
+            self.assertEqual([row['task_metadata']['severity_word'] for row in rows], values)
+            for row in rows:
+                self.assertNotIn('{', row['text'])
+                self.assertNotIn('}', row['text'])
+                self.assertNotIn('stakes', row['task_metadata'])
+                self.assertEqual(row['template_metadata'], {
+                    'template': template,
+                    'domain': domain,
+                    'reference_template_id': template_id,
+                    'flip_strategy': 'resolved_from_fixed_incident',
+                    'expected_direction': 'decreasing_in_reference_order',
+                })
+                for field in ('base_value', 'base_unit', 'unit_variant', 'number_format',
+                              'value', 'value_text', 'unit'):
+                    self.assertIsNone(row[field])
+
+    def test_pairwise_dataset_has_one_reference_ordered_pair_per_family(self):
+        reference = {template[0]: template for template in TEMPLATES}
+        pairwise = {template[0]: template for template in severity_pairwise_prompts.TEMPLATES}
+        omitted = {entry['reference_template_id']
+                   for entry in severity_pairwise_prompts.OMITTED_FAMILIES}
+        self.assertEqual(set(pairwise) | omitted, set(reference))
+        self.assertFalse(set(pairwise) & omitted)
+        self.assertEqual(len(pairwise), 20)
+        self.assertFalse(omitted)
+
+        records = severity_pairwise_prompts.build_prompt_records()
+        self.assertEqual(len(records), 40)
+        self.assertEqual(len({record['text'] for record in records}), 40)
+        for template_id, (_, domain, template, pair) in pairwise.items():
+            _, reference_domain, reference_template, reference_values = reference[template_id]
+            self.assertEqual(domain, reference_domain)
+            self.assertEqual(len(pair), 2)
+            self.assertTrue(all(value in reference_values for value in pair))
+            self.assertLess(reference_values.index(pair[0]), reference_values.index(pair[1]))
+            reference_fields = [field for _, field, _, _ in Formatter().parse(reference_template)
+                                if field is not None]
+            pairwise_fields = [field for _, field, _, _ in Formatter().parse(template)
+                               if field is not None]
+            self.assertEqual(pairwise_fields, reference_fields)
+            rows = [record for record in records if record['template_id'] == template_id]
+            self.assertEqual([row['task_metadata']['severity_word'] for row in rows], pair)
+            for row in rows:
+                self.assertNotIn('stakes', row['task_metadata'])
+                self.assertEqual(row['template_metadata']['reference_pair'], pair)
+                self.assertEqual(row['template_metadata']['flip_strategy'],
+                                 'resolved_from_fixed_pair')
+                self.assertEqual(row['template_metadata']['expected_direction'],
+                                 'decreasing_in_reference_order')
 
     def test_wording_dataset_and_independent_variant_lists(self):
         groups = severity_wording_prompts.TASK_GROUPS
@@ -164,6 +243,111 @@ class SeverityTests(unittest.TestCase):
             self.assertEqual(len(inventory.fit_files), 1)
             self.assertEqual(len(inventory.all_keys), 2)
             self.assertTrue(all('severity' not in key for key in inventory.entries))
+
+    def test_flipped_inference_is_isolated_aligned_and_uses_frozen_bundle(self):
+        before = {path.name: path.read_bytes() for path in self.config.surface_dir.iterdir()}
+        records = severity_flipped_prompts.build_prompt_records()
+        directory = self.config.run_dir / 'inference' / 'severity_flipped'
+        with self.mock_model() as (loader, tokenize):
+            reference_csv, _, _ = severity_inference.run(self.config)
+            loader.reset_mock()
+            csv, result, diagnostics = severity_flipped_inference.run(self.config)
+            self.assertEqual(loader.call_count, 1)
+            loader.reset_mock()
+            severity_flipped_inference.run(self.config)
+            loader.assert_not_called()
+        self.assertNotEqual(csv, reference_csv)
+        self.assertEqual(csv.name, 'severity_flipped_arc_lengths.csv')
+        self.assertEqual(list(pd.read_csv(csv).columns), severity_flipped_inference.CSV_COLUMNS)
+        self.assertEqual(len(result), len(records))
+        self.assertEqual(result.severity_word.tolist(),
+                         [record['task_metadata']['severity_word'] for record in records])
+        self.assertTrue(diagnostics.outside_saved_height_range.any())
+        self.assertEqual(before, {path.name: path.read_bytes()
+                                  for path in self.config.surface_dir.iterdir()})
+
+        paths = sorted((directory / 'activations').glob('*.pt'), reverse=True)
+        self.assertEqual(len(paths), 20)
+        self.assertTrue(all(path.name.startswith('severity_flipped_inference--')
+                            for path in paths))
+        reordered, _ = severity_flipped_inference.project_caches(
+            self.config, records, paths)
+        pd.testing.assert_frame_equal(result, reordered)
+        with self.assertRaisesRegex(ValueError, 'Missing'):
+            severity_flipped_inference.project_caches(self.config, records, paths[:-1])
+
+        arrays, _, coordinates = load_surface_bundle(self.config.surface_dir)
+        X = tokenize([record['text'] for record in records])['input_ids'].float().double().numpy()
+        expected = coordinates.map_points(
+            ((X - arrays['pls_mean']) @ arrays['pls_rotations'])[:, :3],
+            progress_seconds=None)
+        for column in severity_flipped_inference.CSV_COLUMNS[2:]:
+            np.testing.assert_allclose(result[column], expected[column])
+
+        changed = copy.deepcopy(records)
+        changed[0]['text'] += ' Please.'
+        with self.mock_model(), self.assertRaisesRegex(RuntimeError, 'Stale'):
+            cache_activations.run_inference(
+                self.config, changed, directory / 'activations',
+                namespace='severity_flipped_inference')
+        training = copy.deepcopy(self.records[:2])
+        for record in training:
+            record['task_metadata'] = {'stakes': 'very_low'}
+        with self.mock_model():
+            cache_activations.run(self.config, {NO_TIME_CORPORA[0]: training})
+        inventory = CacheInventory(self.config.activations_dir, self.config.model_name,
+                                   self.config.layer_component, -1,
+                                   self.config.stakes_merges)
+        self.assertTrue(all('severity_flipped' not in key for key in inventory.entries))
+
+    def test_streamlit_registry_includes_flipped_dataset(self):
+        app = Path('arc_length_app.py').read_text(encoding='utf-8')
+        self.assertIn('"severity_flipped": ("template", "severity_word")', app)
+        self.assertIn('"severity_pairwise": ("template", "severity_word")', app)
+        self.assertNotIn('use_container_width', app)
+
+    def test_pairwise_inference_is_isolated_reusable_and_aligned(self):
+        before = {path.name: path.read_bytes() for path in self.config.surface_dir.iterdir()}
+        records = severity_pairwise_prompts.build_prompt_records()
+        directory = self.config.run_dir / 'inference' / 'severity_pairwise'
+        with self.mock_model() as (loader, tokenize):
+            csv, result, diagnostics = severity_pairwise_inference.run(self.config)
+            self.assertEqual(loader.call_count, 1)
+            loader.reset_mock()
+            severity_pairwise_inference.run(self.config)
+            loader.assert_not_called()
+        self.assertEqual(csv.name, 'severity_pairwise_arc_lengths.csv')
+        self.assertEqual(list(pd.read_csv(csv).columns), severity_pairwise_inference.CSV_COLUMNS)
+        self.assertEqual(len(result), 40)
+        self.assertEqual(result.severity_word.tolist(),
+                         [record['task_metadata']['severity_word'] for record in records])
+        self.assertTrue(diagnostics.outside_saved_height_range.any())
+        self.assertEqual(before, {path.name: path.read_bytes()
+                                  for path in self.config.surface_dir.iterdir()})
+
+        paths = sorted((directory / 'activations').glob('*.pt'), reverse=True)
+        self.assertEqual(len(paths), 20)
+        self.assertTrue(all(path.name.startswith('severity_pairwise_inference--')
+                            for path in paths))
+        reordered, _ = severity_pairwise_inference.project_caches(self.config, records, paths)
+        pd.testing.assert_frame_equal(result, reordered)
+        with self.assertRaisesRegex(ValueError, 'Missing'):
+            severity_pairwise_inference.project_caches(self.config, records, paths[:-1])
+
+        arrays, _, coordinates = load_surface_bundle(self.config.surface_dir)
+        X = tokenize([record['text'] for record in records])['input_ids'].float().double().numpy()
+        expected = coordinates.map_points(
+            ((X - arrays['pls_mean']) @ arrays['pls_rotations'])[:, :3],
+            progress_seconds=None)
+        for column in severity_pairwise_inference.CSV_COLUMNS[2:]:
+            np.testing.assert_allclose(result[column], expected[column])
+
+        changed = copy.deepcopy(records)
+        changed[0]['text'] += ' Please.'
+        with self.mock_model(), self.assertRaisesRegex(RuntimeError, 'Stale'):
+            cache_activations.run_inference(
+                self.config, changed, directory / 'activations',
+                namespace='severity_pairwise_inference')
 
     def test_end_to_end_reuse_alignment_and_frozen_bundle(self):
         before = {p.name: p.read_bytes() for p in self.config.surface_dir.iterdir()}

@@ -12,6 +12,8 @@ ARTIFACTS = Path(__file__).parent / "artifacts" / "content" / "artifacts"
 # group column (defines the ordinal sequence) and label column per dataset
 DATASETS = {
     "severity": ("template", "severity_word"),
+    "severity_flipped": ("template", "severity_word"),
+    "severity_pairwise": ("template", "severity_word"),
     "severity_wording": ("task", "prompt"),
 }
 
@@ -54,7 +56,7 @@ for metric in ("arc_length_parallel", "arc_length_orthogonal"):
     )
     fig.update_layout(height=550, legend=dict(font=dict(size=10)))
     fig.update_xaxes(dtick=1)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 with st.expander("Raw data"):
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width="stretch")
