@@ -3,15 +3,21 @@ from . import inference_projection
 from .corpora.inference.context_prompts import build_prompt_records
 
 
-CSV_COLUMNS = ['task', 'context', 'context_position', 'prompt',
+CSV_COLUMNS = ['task', 'context', 'context_position', 'ladder_rank', 'reality_status',
+               'answer_use', 'is_control', 'phrasing_index', 'prompt',
                'arc_length_parallel', 'arc_length_orthogonal']
+
+# Carried through so a condition can be averaged over its interchangeable
+# phrasings, and so the ladder can be read without rejoining the prompt file.
+_METADATA_COLUMNS = ('context', 'context_position', 'ladder_rank', 'reality_status',
+                     'answer_use', 'is_control', 'phrasing_index')
 
 
 def _row_fields(record):
+    metadata = record['task_metadata']
     return dict(
         task=record['task'],
-        context=record['task_metadata']['context'],
-        context_position=record['task_metadata']['context_position'],
+        **{name: metadata[name] for name in _METADATA_COLUMNS},
         prompt=record['text'],
     )
 

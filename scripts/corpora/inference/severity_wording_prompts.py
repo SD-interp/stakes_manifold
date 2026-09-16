@@ -63,7 +63,5 @@ def build_prompt_records():
                 text=text, template_id=group['id'], task=task,
                 template_metadata={'template': variant, 'prompt_framing': 'severity_wording'},
                 task_metadata={'usage': 'inference_only'},
-                base_value=None, base_unit=None, unit_variant=None, number_format=None,
-                value=None, value_text=None, unit=None,
             ))
     return records

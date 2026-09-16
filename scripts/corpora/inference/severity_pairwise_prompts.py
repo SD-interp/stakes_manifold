@@ -105,7 +105,7 @@ TEMPLATES = [
 
 
 def build_prompt_records():
-    """Preserve the standard record fields, with no stakes or time labels."""
+    """Emit one record per curated pair, with no stakes or time labels."""
     if len(TEMPLATES) != 10 or len({t[0] for t in TEMPLATES}) != 10:
         raise ValueError("Expected exactly 10 uniquely identified templates.")
     records, seen = [], set()
@@ -136,13 +136,6 @@ def build_prompt_records():
                         "family": family,
                         "usage": "inference_only",
                     },
-                    base_value=None,
-                    base_unit=None,
-                    unit_variant=None,
-                    number_format=None,
-                    value=None,
-                    value_text=None,
-                    unit=None,
                 )
             )
     return records

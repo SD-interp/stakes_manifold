@@ -306,7 +306,7 @@ TEMPLATES = [
 
 
 def build_prompt_records():
-    """Preserve the standard record fields, with no stakes or time labels."""
+    """Emit one record per slot value, with no stakes or time labels."""
     if len(TEMPLATES) != 35 or len({t[0] for t in TEMPLATES}) != 35:
         raise ValueError("Expected exactly 35 uniquely identified templates.")
     records, seen = [], set()
@@ -332,13 +332,6 @@ def build_prompt_records():
                     template_metadata={"template": template, "domain": domain},
                     task=template_id,
                     task_metadata={"severity_word": value, "usage": "inference_only"},
-                    base_value=None,
-                    base_unit=None,
-                    unit_variant=None,
-                    number_format=None,
-                    value=None,
-                    value_text=None,
-                    unit=None,
                 )
             )
     return records
