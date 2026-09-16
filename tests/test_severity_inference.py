@@ -232,14 +232,14 @@ class SeverityTests(unittest.TestCase):
     def test_pairwise_dataset_contrasts_low_and_high_severity_fillers(self):
         reference = {template[0]: template for template in TEMPLATES}
         pairwise = {template[0]: template for template in severity_pairwise_prompts.TEMPLATES}
-        self.assertEqual(len(pairwise), 15)
+        self.assertEqual(len(pairwise), 10)
         # Each pair names the reference family it contrasts, and introduces its own ID.
         self.assertTrue({template[2] for template in severity_pairwise_prompts.TEMPLATES}
                         <= set(reference))
         self.assertFalse(set(pairwise) & set(reference))
 
         records = severity_pairwise_prompts.build_prompt_records()
-        self.assertEqual(len(records), 30)
+        self.assertEqual(len(records), 20)
         self.assertEqual(len({record['text'] for record in records}), len(records))
         reference_texts = {record['text'] for record in self.records}
         for template_id, (_, domain, family, template, low, high) in pairwise.items():
@@ -272,7 +272,7 @@ class SeverityTests(unittest.TestCase):
 
         changed = [tuple(template) for template in severity_pairwise_prompts.TEMPLATES][:-1]
         with patch.object(severity_pairwise_prompts, 'TEMPLATES', changed):
-            with self.assertRaisesRegex(ValueError, '15 uniquely identified'):
+            with self.assertRaisesRegex(ValueError, '10 uniquely identified'):
                 severity_pairwise_prompts.build_prompt_records()
 
     def test_wording_dataset_and_independent_variant_lists(self):
@@ -428,7 +428,7 @@ class SeverityTests(unittest.TestCase):
         self.assertEqual(csv.name, 'severity_pairwise_arc_lengths.csv')
         self.assertEqual(list(pd.read_csv(csv).columns), severity_pairwise_inference.CSV_COLUMNS)
         self.assertEqual(len(result), len(records))
-        self.assertEqual(len(result), 30)
+        self.assertEqual(len(result), 20)
         self.assertEqual(result.severity_word.tolist(),
                          [record['task_metadata']['severity_word'] for record in records])
         self.assertTrue(diagnostics.outside_saved_height_range.any())

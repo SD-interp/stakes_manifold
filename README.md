@@ -88,11 +88,15 @@ nor fitting caches can be reused accidentally. Projection uses the frozen saved 
 these prompts never contribute to fitting or slice coverage.
 
 The pairwise counterfactual dataset in
-`scripts/corpora/inference/severity_pairwise_prompts.py` selects one curated pair from each of the
-20 reference families (40 prompts total). Both members of a pair appear in the same fixed
-incident, and the substituted member is the only harm resolved. This predicts a local
-decrease across the two reference-ordered rows without claiming an exact reversal of the
-family's other values or asserting that the model must exhibit that result.
+`scripts/corpora/inference/severity_pairwise_prompts.py` selects one curated pair from each of
+10 reference families (20 prompts total). A pair reuses its family's least and most severe
+slot values verbatim, but places them in a context that reverses their real stakes: the
+reference-high value is simply what belongs there, while the reference-low value is what
+signals that something has gone badly wrong. The `severity_pole` field names each value's
+rank in the reference corpus, so a representation tracking surface wording should order a
+pair the way the poles are labelled, while one tracking actual stakes should order it the
+other way. This is a prediction about the contrast, not a claim that the model must
+exhibit it.
 
 Pairwise outputs are isolated under
 `artifacts/<model name>/inference/severity_pairwise/`, including `prompts.json`, an
