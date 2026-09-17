@@ -6,6 +6,7 @@ All generated files for one model live under `artifacts/<model slug>/`:
 """
 from dataclasses import dataclass, field
 from pathlib import Path
+import json
 import re
 
 from .corpora.training.base_task_set import STAKES_LEVELS
@@ -18,6 +19,15 @@ REGISTERS = {'conversational_no_time': 'bare_task', 'task_only': 'conversational
              'impersonal_no_horizon': 'impersonal', 'expert_no_horizon': 'expert'}
 NO_TIME_CORPORA = tuple(REGISTERS)
 DEFAULT_STAKES_MERGES = {'near_existential': 'existential', 'medium_low': 'medium'}
+
+# The caching half writes this beside the artifacts it produces and the analysis half
+# reads it back, so the two halves agree on the settings the caches were made with
+# without the analysis host contacting Hugging Face or retyping a configuration.
+RUN_CONFIG_FILE = 'run_config.json'
+# Device, artifact root and weights cache describe the machine, not the caches, so
+# they are deliberately absent: each half sets its own.
+SHARED_SETTINGS = ('model_name', 'naming_convention', 'layer_component', 'position',
+                   'batch_size', 'stakes_merges')
 
 # Extend this registry with the dotted layer-count config attribute and the
 # exact decoder-block path from dict(model.named_modules()); {layer} is zero-based.
@@ -109,8 +119,62 @@ class RunConfig:
             raise ValueError(f'Unknown horizon-free corpus: {corpus}')
         return sorted(self.activations_dir.glob(f'{corpus}--*.pt'))
 
+    def shared_settings(self):
+        """The settings both pipeline halves must agree on."""
+        return {name: getattr(self, name) for name in SHARED_SETTINGS}
+
     def describe(self):
         cache = self.hf_cache_dir or 'Hugging Face default'
         return (f'{self.model_name}, {self.layer_component}, position {self.position}, '
                 f'batch size {self.batch_size} -> {self.run_dir} '
                 f'(weights cache: {cache})')
+
+
+def save_run_config(config, force=False):
+    """Record, beside the artifacts, the settings the analysis half must reuse.
+
+    A manifest that disagrees with `config` means the directory already holds caches
+    made with other settings, which the analysis half would silently mix. That raises
+    unless `force`, the same flag that rebuilds those caches.
+    """
+    settings = config.shared_settings()
+    path = config.run_dir / RUN_CONFIG_FILE
+    if path.is_file() and not force:
+        recorded = json.loads(path.read_text(encoding='utf-8'))
+        differing = sorted(name for name in set(recorded) | set(settings)
+                           if recorded.get(name) != settings.get(name))
+        if differing:
+            raise ValueError(f'{path} records different settings for {differing}; '
+                             'use another artifact_root, or rebuild with FORCE.')
+    config.run_dir.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix('.json.tmp')
+    temporary.write_text(json.dumps(settings, indent=2, sort_keys=True), encoding='utf-8')
+    temporary.replace(path)
+    return path
+
+
+def load_run_config(run_dir, **overrides):
+    """Rebuild the RunConfig whose artifacts are in `run_dir`."""
+    run_dir = Path(run_dir).resolve()
+    path = run_dir / RUN_CONFIG_FILE
+    if not path.is_file():
+        raise FileNotFoundError(f'No {RUN_CONFIG_FILE} in {run_dir}; run the caching '
+                                'notebook for this model first.')
+    recorded = json.loads(path.read_text(encoding='utf-8'))
+    missing = [name for name in SHARED_SETTINGS if name not in recorded]
+    if missing:
+        raise ValueError(f'{path} is missing {missing}.')
+    config = RunConfig(artifact_root=run_dir.parent,
+                       **{name: recorded[name] for name in SHARED_SETTINGS}, **overrides)
+    if config.run_dir.resolve() != run_dir:
+        raise ValueError(f'{path} names {config.model_name}, whose artifacts belong in '
+                         f'{config.run_dir}, not {run_dir}.')
+    return config
+
+
+def discover_run_dirs(artifact_root):
+    """Every model directory under `artifact_root` the caching half has written."""
+    root = Path(artifact_root)
+    if not root.is_dir():
+        return []
+    return sorted(path for path in root.iterdir() if (path / RUN_CONFIG_FILE).is_file())

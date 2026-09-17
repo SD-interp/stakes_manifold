@@ -16,7 +16,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from scripts import (cache_activations, context_inference, severity_composition_inference,
+from scripts import (cache_activations, context_inference, inference_datasets,
+                     pipeline_config, severity_composition_inference,
                      severity_flipped_inference,
                      severity_inference, severity_length_inference,
                      severity_magnitude_inference, severity_null_inference,
@@ -80,9 +81,11 @@ class SeverityTests(unittest.TestCase):
             return {'input_ids': torch.tensor([[len(t) / 10, 0.5, (len(t) % 7) - 3] for t in texts])}
 
         hook_module = SimpleNamespace(HookSpecPost=lambda spec, fn: fn, temporary_hooks=hooks)
+        model = Model()
+        # load_model stays patched so a stage that loads a model of its own is caught.
         with patch.dict('sys.modules', {'utils.mech_interp_toolkit.hook_utils': hook_module}), \
-             patch.object(cache_activations, 'load_model', return_value=(Model(), tokenize)) as loader:
-            yield loader, tokenize
+             patch.object(cache_activations, 'load_model', return_value=(model, tokenize)) as loader:
+            yield loader, tokenize, model
 
     @staticmethod
     def as_training_records(records):
@@ -94,7 +97,7 @@ class SeverityTests(unittest.TestCase):
             record['base_unit'] = None
         return training
 
-    def test_dataset_and_notebook(self):
+    def test_dataset_and_registry(self):
         self.assertEqual(len(TEMPLATES), 35)
         self.assertEqual(len(self.records), sum(len(t[3]) for t in TEMPLATES))
         self.assertEqual(len(self.records), 171)
@@ -108,23 +111,131 @@ class SeverityTests(unittest.TestCase):
             self.assertNotIn('stakes', record['task_metadata'])
             for field in ('base_value', 'base_unit', 'unit_variant', 'number_format', 'value', 'value_text', 'unit'):
                 self.assertNotIn(field, record)
-        nb = json.loads(Path('notebooks/arc_length_pipeline.ipynb').read_text(encoding='utf-8'))
-        for i, cell in enumerate(nb['cells']):
+        # Both halves walk the registry, and every corpus in it can also be rated.
+        self.assertEqual({dataset.name for dataset in inference_datasets.DATASETS},
+                         set(stated_stakes.DATASETS))
+        self.assertEqual(len(inference_datasets.DATASETS), 10)
+        self.assertIs(inference_datasets.by_name('severity'), severity_inference.DATASET)
+
+    @staticmethod
+    def notebook_code(name):
+        nb = json.loads((Path('notebooks') / name).read_text(encoding='utf-8'))
+        for index, cell in enumerate(nb['cells']):
             if cell['cell_type'] == 'code':
-                compile(''.join(cell['source']), f'cell-{i}', 'exec')
-        code = '\n'.join(''.join(c['source']) for c in nb['cells'])
-        self.assertLess(code.index('pipeline.export('), code.index('severity_inference.run('))
-        self.assertLess(code.index('severity_inference.run('), code.index('severity_null_inference.run('))
-        self.assertLess(code.index('severity_null_inference.run('), code.index('severity_length_inference.run('))
-        self.assertLess(code.index('severity_length_inference.run('), code.index('severity_magnitude_inference.run('))
-        self.assertLess(code.index('severity_magnitude_inference.run('), code.index('severity_composition_inference.run('))
-        self.assertLess(code.index('severity_composition_inference.run('), code.index('severity_flipped_inference.run('))
-        self.assertLess(code.index('severity_flipped_inference.run('), code.index('severity_pairwise_inference.run('))
-        self.assertLess(code.index('severity_pairwise_inference.run('), code.index('severity_wording_inference.run('))
-        self.assertLess(code.index('severity_wording_inference.run('), code.index('severity_verb_inference.run('))
-        self.assertLess(code.index('severity_verb_inference.run('), code.index('context_inference.run('))
-        # Generation runs last: it reloads the model, and by then every CSV is exported.
-        self.assertLess(code.index('context_inference.run('), code.index('stated_stakes.run_all('))
+                compile(''.join(cell['source']), f'{name}-cell-{index}', 'exec')
+        return '\n'.join(''.join(cell['source']) for cell in nb['cells'])
+
+    def test_caching_notebook_is_the_only_gpu_half(self):
+        """Part one loads each model once, caches everything, and fits nothing."""
+        code = self.notebook_code('arc_length_cache.ipynb')
+        self.assertEqual(code.count('cache_activations.load_model('), 1)
+        for stage in ('save_run_config(config, force=FORCE)',
+                      'cache_activations.run(config, datasets',
+                      'for dataset in inference_datasets.DATASETS:',
+                      'dataset.cache(config, model, tokenizer, force=FORCE)',
+                      'stated_stakes.cache_all(config, RATING_DATASETS'):
+            self.assertIn(stage, code)
+        # The settings manifest is written before any weights are downloaded.
+        self.assertLess(code.index('save_run_config('), code.index('load_model('))
+        # Nothing here fits, projects or exports a coordinate.
+        for absent in ('StakesSurfacePipeline', '.project(', 'stated_stakes.export',
+                       'load_surface_bundle', '_arc_lengths.csv'):
+            self.assertNotIn(absent, code)
+
+    def test_surface_notebook_is_the_only_cpu_half(self):
+        """Part two reads caches only: no loader, no GPU, no Hugging Face."""
+        code = self.notebook_code('arc_length_surface.ipynb')
+        for stage in ('load_run_config(run_dir)', 'StakesSurfacePipeline(config)',
+                      'dataset.project(config)', 'stated_stakes.export_all(config, rated)',
+                      "pipeline.export(notebook='notebooks/arc_length_surface.ipynb')"):
+            self.assertIn(stage, code)
+        # Projection happens against an exported surface, never before one.
+        self.assertLess(code.index('pipeline.export('), code.index('dataset.project('))
+        for absent in ('load_model', 'cache_activations.run', 'dataset.cache(',
+                       'stated_stakes.cache(', 'stated_stakes.cache_all',
+                       'import torch', 'torch.cuda', 'transformers', 'FORCE'):
+            self.assertNotIn(absent, code)
+        # Each half names the other, so neither can be run out of order by accident.
+        self.assertIn('arc_length_cache.ipynb', code)
+        self.assertIn('arc_length_surface.ipynb',
+                      self.notebook_code('arc_length_cache.ipynb'))
+
+    def test_both_halves_agree_on_the_run_settings(self):
+        """The manifest round-trips every setting the analysis half must reuse."""
+        config = RunConfig(artifact_root=Path(self.temp.name), device='cpu', batch_size=2,
+                           layer_component='layer_out/9',
+                           stakes_merges={'medium_low': 'medium'})
+        path = pipeline_config.save_run_config(config)
+        self.assertEqual(path, config.run_dir / pipeline_config.RUN_CONFIG_FILE)
+        self.assertEqual(pipeline_config.discover_run_dirs(self.temp.name), [config.run_dir])
+        restored = pipeline_config.load_run_config(config.run_dir)
+        self.assertEqual(restored.shared_settings(), config.shared_settings())
+        self.assertEqual(restored.run_dir, config.run_dir)
+        # The machine's own settings are not carried across.
+        self.assertIsNone(restored.device)
+        self.assertIsNone(restored.hf_cache_dir)
+        self.assertEqual(pipeline_config.load_run_config(config.run_dir, device='cuda').device,
+                         'cuda')
+
+        pipeline_config.save_run_config(config)  # identical settings: no complaint
+        moved = RunConfig(artifact_root=Path(self.temp.name), device='cpu', batch_size=2,
+                          layer_component='layer_out/11')
+        with self.assertRaisesRegex(ValueError, 'records different settings'):
+            pipeline_config.save_run_config(moved)
+        pipeline_config.save_run_config(moved, force=True)
+        self.assertEqual(pipeline_config.load_run_config(config.run_dir).layer_component,
+                         'layer_out/11')
+        with self.assertRaisesRegex(FileNotFoundError, 'run_config.json'):
+            pipeline_config.load_run_config(Path(self.temp.name) / 'never-cached')
+
+    def test_cache_and_project_halves_match_one_combined_run(self):
+        """Splitting the pass across two machines must not change a single number."""
+        dataset = inference_datasets.by_name('severity_pairwise')
+        records = dataset.build_records()
+        with self.mock_model() as (loader, tokenize, model):
+            combined_csv, combined, _ = dataset.run(self.config, model, tokenize)
+            combined_rows = combined_csv.read_text(encoding='utf-8')
+            combined_csv.unlink()
+
+            # The GPU half again, this time with no surface in sight.
+            surface = {path: path.read_bytes() for path in self.config.surface_dir.iterdir()}
+            for path in self.config.surface_dir.iterdir():
+                path.unlink()
+            paths = dataset.cache(self.config, model, tokenize)
+            loader.assert_not_called()
+            self.assertEqual(len(paths), len({r['template_id'] for r in records}))
+            for path, payload in surface.items():
+                path.write_bytes(payload)
+
+        # The CPU half: no model is in scope at all.
+        split_csv, split, _ = dataset.project(self.config)
+        self.assertEqual(split_csv, combined_csv)
+        self.assertEqual(split_csv.read_text(encoding='utf-8'), combined_rows)
+        pd.testing.assert_frame_equal(split, combined)
+
+        for path in (self.config.run_dir / 'inference' / dataset.name / 'activations').glob('*.pt'):
+            path.unlink()
+        with self.assertRaisesRegex(FileNotFoundError, 'caching notebook'):
+            dataset.project(self.config)
+
+    def test_rating_cache_and_export_halves_split_the_same_way(self):
+        name = 'severity_pairwise'
+        with self.mock_rating_model() as (loader, model, tokenizer):
+            combined = stated_stakes.run(self.config, name, model=model, tokenizer=tokenizer,
+                                         max_new_tokens=4)
+            self.assertEqual(stated_stakes.cached_datasets(self.config), [name])
+            stated_stakes.cache(self.config, name, model=model, tokenizer=tokenizer,
+                                max_new_tokens=4)
+            loader.assert_not_called()
+
+        # Parsing needs no model, and re-exports from the cached continuations alone.
+        split = stated_stakes.export(self.config, name)
+        self.assertEqual(split[:2], combined[:2])
+        pd.testing.assert_frame_equal(split[2], combined[2])
+        pd.testing.assert_frame_equal(split[3], combined[3])
+        self.assertEqual(stated_stakes.cached_datasets(self.config, ['severity_null']), [])
+        with self.assertRaisesRegex(FileNotFoundError, 'caching notebook'):
+            stated_stakes.export(self.config, 'severity_null')
 
     def test_context_dataset_is_a_constructed_ladder_with_controls(self):
         contexts, groups = context_prompts.CONTEXTS, context_prompts.TASK_GROUPS
@@ -211,16 +322,15 @@ class SeverityTests(unittest.TestCase):
         before = {path.name: path.read_bytes() for path in self.config.surface_dir.iterdir()}
         records = context_prompts.build_prompt_records()
         directory = self.config.run_dir / 'inference' / 'context'
-        with self.mock_model() as (loader, tokenize):
-            csv, result, diagnostics = context_inference.run(self.config)
-            self.assertEqual(loader.call_count, 1)
+        with self.mock_model() as (loader, tokenize, model):
+            csv, result, diagnostics = context_inference.run(self.config, model, tokenize)
+            loader.assert_not_called()
             cache_times = {path: path.stat().st_mtime_ns
                            for path in (directory / 'activations').glob('*.pt')}
             self.assertEqual(len(cache_times), 5)
             self.assertTrue(all(path.name.startswith('context_inference--')
                                 for path in cache_times))
-            loader.reset_mock()
-            context_inference.run(self.config)
+            context_inference.run(self.config, model, tokenize)
             loader.assert_not_called()
             self.assertEqual(cache_times, {path: path.stat().st_mtime_ns
                                            for path in cache_times})
@@ -540,23 +650,26 @@ class SeverityTests(unittest.TestCase):
                 return torch.zeros((input_ids.shape[0], input_ids.shape[1] + max_new_tokens),
                                    dtype=torch.long)
 
+        model, tokenizer = Model(), Tokenizer()
+        # load_model stays patched so a rating pass that loads its own model is caught.
         with patch.object(cache_activations, 'load_model',
-                          return_value=(Model(), Tokenizer())) as loader:
-            yield loader
+                          return_value=(model, tokenizer)) as loader:
+            yield loader, model, tokenizer
 
     def test_stated_ratings_are_cached_parsed_and_row_aligned(self):
         records = severity_pairwise_prompts.build_prompt_records()
         build = severity_pairwise_prompts.build_prompt_records
         directory = self.config.run_dir / 'inference' / 'severity_pairwise'
         phrasings = len(rating_phrasings.PHRASINGS)
-        with self.mock_rating_model() as loader:
+        with self.mock_rating_model() as (loader, model, tokenizer):
             csv, summary_csv, table, summary = stated_stakes.run(
-                self.config, 'severity_pairwise', build, max_new_tokens=4)
-            self.assertEqual(loader.call_count, 1)
+                self.config, 'severity_pairwise', build, model=model, tokenizer=tokenizer,
+                max_new_tokens=4)
+            loader.assert_not_called()
             caches = sorted((directory / 'ratings').glob('ratings--*.json'))
             times = {path: path.stat().st_mtime_ns for path in caches}
-            loader.reset_mock()
-            stated_stakes.run(self.config, 'severity_pairwise', build, max_new_tokens=4)
+            stated_stakes.run(self.config, 'severity_pairwise', build, model=model,
+                              tokenizer=tokenizer, max_new_tokens=4)
             loader.assert_not_called()
             self.assertEqual(times, {path: path.stat().st_mtime_ns for path in times})
 
@@ -705,9 +818,9 @@ class SeverityTests(unittest.TestCase):
     def test_composition_inference_is_isolated_and_aligned(self):
         records = severity_composition_prompts.build_prompt_records()
         directory = self.config.run_dir / 'inference' / 'severity_composition'
-        with self.mock_model() as (loader, _):
-            csv, result, _ = severity_composition_inference.run(self.config)
-            self.assertEqual(loader.call_count, 1)
+        with self.mock_model() as (loader, tokenize, model):
+            csv, result, _ = severity_composition_inference.run(self.config, model, tokenize)
+            loader.assert_not_called()
             paths = sorted((directory / 'activations').glob('*.pt'))
         self.assertEqual(len(paths), len(severity_composition_prompts.HARM_SETS))
         self.assertTrue(all(path.name.startswith('severity_composition_inference--')
@@ -725,9 +838,9 @@ class SeverityTests(unittest.TestCase):
     def test_magnitude_inference_is_isolated_and_aligned(self):
         records = severity_magnitude_prompts.build_prompt_records()
         directory = self.config.run_dir / 'inference' / 'severity_magnitude'
-        with self.mock_model() as (loader, _):
-            csv, result, _ = severity_magnitude_inference.run(self.config)
-            self.assertEqual(loader.call_count, 1)
+        with self.mock_model() as (loader, tokenize, model):
+            csv, result, _ = severity_magnitude_inference.run(self.config, model, tokenize)
+            loader.assert_not_called()
             paths = sorted((directory / 'activations').glob('*.pt'))
         self.assertEqual(len(paths), len(severity_magnitude_prompts.FAMILIES))
         self.assertTrue(all(path.name.startswith('severity_magnitude_inference--')
@@ -747,9 +860,9 @@ class SeverityTests(unittest.TestCase):
     def test_null_inference_is_isolated_and_aligned(self):
         records = severity_null_prompts.build_prompt_records()
         directory = self.config.run_dir / 'inference' / 'severity_null'
-        with self.mock_model() as (loader, _):
-            csv, result, _ = severity_null_inference.run(self.config)
-            self.assertEqual(loader.call_count, 1)
+        with self.mock_model() as (loader, tokenize, model):
+            csv, result, _ = severity_null_inference.run(self.config, model, tokenize)
+            loader.assert_not_called()
             paths = sorted((directory / 'activations').glob('*.pt'))
             self.assertEqual(len(paths), len(severity_null_prompts.FAMILIES))
             self.assertTrue(all(path.name.startswith('severity_null_inference--')
@@ -769,9 +882,9 @@ class SeverityTests(unittest.TestCase):
     def test_length_inference_is_isolated_and_aligned(self):
         records = severity_length_prompts.build_prompt_records()
         directory = self.config.run_dir / 'inference' / 'severity_length'
-        with self.mock_model() as (loader, _):
-            csv, result, _ = severity_length_inference.run(self.config)
-            self.assertEqual(loader.call_count, 1)
+        with self.mock_model() as (loader, tokenize, model):
+            csv, result, _ = severity_length_inference.run(self.config, model, tokenize)
+            loader.assert_not_called()
             paths = sorted((directory / 'activations').glob('*.pt'))
             self.assertEqual(len(paths), len(severity_length_prompts.FAMILIES))
             self.assertTrue(all(path.name.startswith('severity_length_inference--')
@@ -795,9 +908,9 @@ class SeverityTests(unittest.TestCase):
     def test_verb_inference_is_isolated_and_aligned(self):
         records = severity_verb_prompts.build_prompt_records()
         directory = self.config.run_dir / 'inference' / 'severity_verb'
-        with self.mock_model() as (loader, _):
-            csv, result, _ = severity_verb_inference.run(self.config)
-            self.assertEqual(loader.call_count, 1)
+        with self.mock_model() as (loader, tokenize, model):
+            csv, result, _ = severity_verb_inference.run(self.config, model, tokenize)
+            loader.assert_not_called()
             paths = sorted((directory / 'activations').glob('*.pt'))
             self.assertEqual(len(paths), len(severity_verb_prompts.PREDICAMENTS))
             self.assertTrue(all(path.name.startswith('severity_verb_inference--')
@@ -840,8 +953,8 @@ class SeverityTests(unittest.TestCase):
             cache_activations.load_model(custom)
         self.assertEqual(seen, [None, str(weights.resolve())])
 
-    def test_inference_modules_reuse_a_caller_supplied_model(self):
-        """A sweep that holds one model must never make a dataset load a second copy."""
+    def test_no_inference_module_loads_a_model_of_its_own(self):
+        """One held model serves every dataset; a module may not load a second copy."""
         modules = [(severity_inference, 'severity'), (severity_null_inference, 'severity_null'),
                    (severity_length_inference, 'severity_length'),
                    (severity_magnitude_inference, 'severity_magnitude'),
@@ -851,20 +964,25 @@ class SeverityTests(unittest.TestCase):
                    (severity_wording_inference, 'severity_wording'),
                    (severity_verb_inference, 'severity_verb'),
                    (context_inference, 'context')]
-        with self.mock_model() as (loader, _):
-            model, tokenizer = loader.return_value
-            loader.reset_mock()
+        with self.mock_model() as (loader, tokenize, model):
             for module, dataset in modules:
-                csv, result, _ = module.run(self.config, model=model, tokenizer=tokenizer)
+                csv, result, _ = module.run(self.config, model=model, tokenizer=tokenize)
                 self.assertEqual(csv.parent, self.config.run_dir / 'inference' / dataset)
                 self.assertTrue(len(result))
             loader.assert_not_called()
+            for module, _ in modules:
+                with self.assertRaisesRegex(ValueError, 'loaded model and tokenizer'):
+                    module.run(self.config, None, None, force=True)
 
-    def test_rating_pass_loads_the_model_once_for_every_corpus(self):
+    def test_rating_pass_reuses_the_model_the_caller_holds(self):
         datasets = ['severity_pairwise', 'severity_wording']
-        with self.mock_rating_model() as loader:
-            results = stated_stakes.run_all(self.config, datasets, max_new_tokens=4)
-            self.assertEqual(loader.call_count, 1)
+        with self.mock_rating_model() as (loader, model, tokenizer):
+            results = stated_stakes.run_all(self.config, datasets, model=model,
+                                            tokenizer=tokenizer, max_new_tokens=4)
+            loader.assert_not_called()
+            with self.assertRaisesRegex(ValueError, 'loaded model and tokenizer'):
+                stated_stakes.run_all(self.config, datasets, model=None, tokenizer=None,
+                                      force=True, max_new_tokens=4)
         self.assertEqual(list(results), datasets)
         for name in datasets:
             csv, summary_csv, table, summary = results[name]
@@ -885,7 +1003,8 @@ class SeverityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'must not be empty'):
             stated_stakes.build_rating_records([])
         with self.assertRaisesRegex(ValueError, 'Unknown rating datasets'):
-            stated_stakes.run_all(self.config, ['not_a_dataset'])
+            stated_stakes.run_all(self.config, ['not_a_dataset'], model=object(),
+                                  tokenizer=object())
 
     def test_flipped_dataset_preserves_reference_contract(self):
         reference = {template[0]: template for template in TEMPLATES}
@@ -1009,26 +1128,26 @@ class SeverityTests(unittest.TestCase):
         records = severity_wording_prompts.build_prompt_records()
         directory = self.config.run_dir / 'inference' / 'severity_wording'
         training = self.as_training_records(self.records[:2])
-        with self.mock_model() as (loader, tokenize):
-            cache_activations.run(self.config, {NO_TIME_CORPORA[0]: training})
-            original_csv, original, _ = severity_inference.run(self.config)
+        with self.mock_model() as (loader, tokenize, model):
+            cache_activations.run(self.config, {NO_TIME_CORPORA[0]: training}, model, tokenize)
+            original_csv, original, _ = severity_inference.run(self.config, model, tokenize)
             original_files = {p: p.read_bytes() for p in self.directory.rglob('*') if p.is_file()}
-            csv, result, diagnostics = severity_wording_inference.run(self.config)
+            csv, result, diagnostics = severity_wording_inference.run(self.config, model, tokenize)
             self.assertNotEqual(csv, original_csv)
             self.assertEqual(csv.name, 'severity_wording_arc_lengths.csv')
             self.assertEqual(original_files, {p: p.read_bytes() for p in original_files})
             cache_times = {p: p.stat().st_mtime_ns for p in (directory / 'activations').glob('*.pt')}
             self.assertEqual(len(cache_times), 20)
             self.assertTrue(all(p.name.startswith('severity_wording_inference--') for p in cache_times))
-            loader.reset_mock()
-            severity_inference.run(self.config)
-            severity_wording_inference.run(self.config)
+            severity_inference.run(self.config, model, tokenize)
+            severity_wording_inference.run(self.config, model, tokenize)
             loader.assert_not_called()
             self.assertEqual(cache_times, {p: p.stat().st_mtime_ns for p in cache_times})
             changed = copy.deepcopy(records)
             changed[0]['text'] += ' Please.'
             with self.assertRaisesRegex(RuntimeError, 'Stale'):
                 cache_activations.run_inference(self.config, changed, directory / 'activations',
+                                                model, tokenize,
                                                 namespace='severity_wording_inference')
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.config.surface_dir.iterdir()})
         self.assertEqual(list(pd.read_csv(csv).columns), severity_wording_inference.CSV_COLUMNS)
@@ -1059,13 +1178,11 @@ class SeverityTests(unittest.TestCase):
         before = {path.name: path.read_bytes() for path in self.config.surface_dir.iterdir()}
         records = severity_flipped_prompts.build_prompt_records()
         directory = self.config.run_dir / 'inference' / 'severity_flipped'
-        with self.mock_model() as (loader, tokenize):
-            reference_csv, _, _ = severity_inference.run(self.config)
-            loader.reset_mock()
-            csv, result, diagnostics = severity_flipped_inference.run(self.config)
-            self.assertEqual(loader.call_count, 1)
-            loader.reset_mock()
-            severity_flipped_inference.run(self.config)
+        with self.mock_model() as (loader, tokenize, model):
+            reference_csv, _, _ = severity_inference.run(self.config, model, tokenize)
+            csv, result, diagnostics = severity_flipped_inference.run(self.config, model, tokenize)
+            loader.assert_not_called()
+            severity_flipped_inference.run(self.config, model, tokenize)
             loader.assert_not_called()
         self.assertNotEqual(csv, reference_csv)
         self.assertEqual(csv.name, 'severity_flipped_arc_lengths.csv')
@@ -1097,13 +1214,13 @@ class SeverityTests(unittest.TestCase):
 
         changed = copy.deepcopy(records)
         changed[0]['text'] += ' Please.'
-        with self.mock_model(), self.assertRaisesRegex(RuntimeError, 'Stale'):
+        with self.mock_model() as (_, tokenize, model), self.assertRaisesRegex(RuntimeError, 'Stale'):
             cache_activations.run_inference(
-                self.config, changed, directory / 'activations',
+                self.config, changed, directory / 'activations', model, tokenize,
                 namespace='severity_flipped_inference')
         training = self.as_training_records(self.records[:2])
-        with self.mock_model():
-            cache_activations.run(self.config, {NO_TIME_CORPORA[0]: training})
+        with self.mock_model() as (_, tokenize, model):
+            cache_activations.run(self.config, {NO_TIME_CORPORA[0]: training}, model, tokenize)
         inventory = CacheInventory(self.config.activations_dir, self.config.model_name,
                                    self.config.layer_component, -1,
                                    self.config.stakes_merges)
@@ -1119,11 +1236,10 @@ class SeverityTests(unittest.TestCase):
         before = {path.name: path.read_bytes() for path in self.config.surface_dir.iterdir()}
         records = severity_pairwise_prompts.build_prompt_records()
         directory = self.config.run_dir / 'inference' / 'severity_pairwise'
-        with self.mock_model() as (loader, tokenize):
-            csv, result, diagnostics = severity_pairwise_inference.run(self.config)
-            self.assertEqual(loader.call_count, 1)
-            loader.reset_mock()
-            severity_pairwise_inference.run(self.config)
+        with self.mock_model() as (loader, tokenize, model):
+            csv, result, diagnostics = severity_pairwise_inference.run(self.config, model, tokenize)
+            loader.assert_not_called()
+            severity_pairwise_inference.run(self.config, model, tokenize)
             loader.assert_not_called()
         self.assertEqual(csv.name, 'severity_pairwise_arc_lengths.csv')
         self.assertEqual(list(pd.read_csv(csv).columns), severity_pairwise_inference.CSV_COLUMNS)
@@ -1154,18 +1270,17 @@ class SeverityTests(unittest.TestCase):
 
         changed = copy.deepcopy(records)
         changed[0]['text'] += ' Please.'
-        with self.mock_model(), self.assertRaisesRegex(RuntimeError, 'Stale'):
+        with self.mock_model() as (_, tokenize, model), self.assertRaisesRegex(RuntimeError, 'Stale'):
             cache_activations.run_inference(
-                self.config, changed, directory / 'activations',
+                self.config, changed, directory / 'activations', model, tokenize,
                 namespace='severity_pairwise_inference')
 
     def test_end_to_end_reuse_alignment_and_frozen_bundle(self):
         before = {p.name: p.read_bytes() for p in self.config.surface_dir.iterdir()}
-        with self.mock_model() as (loader, tokenize):
-            csv, result, diagnostics = severity_inference.run(self.config)
-            self.assertEqual(loader.call_count, 1)
-            loader.reset_mock()
-            severity_inference.run(self.config)
+        with self.mock_model() as (loader, tokenize, model):
+            csv, result, diagnostics = severity_inference.run(self.config, model, tokenize)
+            loader.assert_not_called()
+            severity_inference.run(self.config, model, tokenize)
             loader.assert_not_called()
         self.assertEqual(list(pd.read_csv(csv).columns), severity_inference.CSV_COLUMNS)
         self.assertEqual(len(result), len(self.records))
@@ -1188,14 +1303,16 @@ class SeverityTests(unittest.TestCase):
             severity_inference.project_caches(self.config, self.records, paths + paths[:1])
         changed = copy.deepcopy(self.records)
         changed[0]['text'] += ' Please.'
-        with self.mock_model(), self.assertRaisesRegex(RuntimeError, 'Stale'):
-            cache_activations.run_inference(self.config, changed, self.directory / 'activations')
+        with self.mock_model() as (_, tokenize, model), self.assertRaisesRegex(RuntimeError, 'Stale'):
+            cache_activations.run_inference(self.config, changed, self.directory / 'activations',
+                                            model, tokenize)
 
     def test_isolation_and_mismatched_model(self):
         with self.assertRaisesRegex(ValueError, 'outside'):
-            cache_activations.run_inference(self.config, self.records, self.config.activations_dir / 'inference')
+            cache_activations.run_inference(self.config, self.records,
+                                            self.config.activations_dir / 'inference', object(), object())
         with self.assertRaisesRegex(ValueError, 'horizon-free'):
-            cache_activations.run(self.config, {'severity_inference': self.records})
+            cache_activations.run(self.config, {'severity_inference': self.records}, object(), object())
         arrays, metadata, coordinates = load_surface_bundle(self.config.surface_dir)
         metadata['model_name'] = 'different-model'
         with self.assertRaisesRegex(ValueError, 'mismatch'):
@@ -1203,9 +1320,10 @@ class SeverityTests(unittest.TestCase):
 
     def test_training_inventory_excludes_inference_and_width_is_checked(self):
         training = self.as_training_records(self.records[:2])
-        with self.mock_model():
-            cache_activations.run(self.config, {NO_TIME_CORPORA[0]: training})
-            paths = cache_activations.run_inference(self.config, self.records[:2], self.directory / 'activations')
+        with self.mock_model() as (_, tokenize, model):
+            cache_activations.run(self.config, {NO_TIME_CORPORA[0]: training}, model, tokenize)
+            paths = cache_activations.run_inference(self.config, self.records[:2],
+                                                    self.directory / 'activations', model, tokenize)
         for _ in range(2):
             inventory = CacheInventory(self.config.activations_dir, self.config.model_name,
                                        self.config.layer_component, -1, self.config.stakes_merges)

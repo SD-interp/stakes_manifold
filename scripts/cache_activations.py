@@ -48,6 +48,10 @@ def activation_dtype(device):
 def load_model(config):
     """Load the model and chat tokenizer with the settings every cache records.
 
+    This is the only place in the package that loads weights, and nothing calls it
+    implicitly: the notebook driving a run calls it once and hands the model and
+    tokenizer to every caching, inference and rating stage.
+
     Weights are downloaded to and read from `config.hf_cache_dir`; None means the
     Hugging Face default location.
     """
@@ -96,11 +100,34 @@ def cache_path(config, dataset, template_id, destination=None):
     return directory / f"{dataset}--{safe_id}-{suffix}.pt"
 
 
-def run(config, datasets, model=None, tokenizer=None, force=False):
+def cached_paths(config, records, destination, dataset, suffix=".pt"):
+    """Return the cache file of every template group in `records`, without a model.
+
+    `cache_path` is a pure function of the template id and destination, so the
+    analysis half resolves what the caching half wrote from the records alone. A
+    missing file means that model's caching pass has not been run, or not been
+    copied across, and says so rather than silently projecting a partial corpus.
+    """
+    destination = Path(destination)
+    paths = [
+        cache_path(config, dataset, template_id, destination).with_suffix(suffix)
+        for template_id in sorted(template_groups(records))
+    ]
+    missing = [path.name for path in paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"{len(missing)} of {len(paths)} caches are missing from {destination} "
+            f"(first: {missing[0]}); run the caching notebook for this model first."
+        )
+    return paths
+
+
+def run(config, datasets, model, tokenizer, force=False):
     """Cache every template group of `datasets` ({corpus: records}); return the cache paths.
 
     Completed caches are reused after fingerprint and row checks; a mismatch raises
-    unless `force`. Without a model argument, the model loads only when needed.
+    unless `force`. The caller owns the model: this module never loads one itself,
+    so a single load serves every stage of a run.
     """
     if not datasets or not set(datasets) <= set(NO_TIME_CORPORA):
         raise ValueError("This caching entry point accepts horizon-free corpora only.")
@@ -111,8 +138,8 @@ def run_inference(
     config,
     records,
     destination,
-    model=None,
-    tokenizer=None,
+    model,
+    tokenizer,
     force=False,
     *,
     namespace="severity_inference",
@@ -138,11 +165,14 @@ def _run(config, datasets, destination, model, tokenizer, force):
 
     from utils.mech_interp_toolkit.hook_utils import HookSpecPost, temporary_hooks
 
-    if (model is None) != (tokenizer is None):
-        raise ValueError("Supply both model and tokenizer, or neither.")
+    if model is None or tokenizer is None:
+        raise ValueError(
+            "A loaded model and tokenizer are required; the caller loads them once "
+            "with load_model and passes them to every stage."
+        )
     if config.position != -1:
         raise ValueError("Expected final token (-1).")
-    device = resolve_device(config) if model is None else str(model.device)
+    device = str(model.device)
     layer = layer_index(config.layer_component)
     layer_component = f"layer_out/{layer}"
     cache_config = dict(
@@ -193,8 +223,6 @@ def _run(config, datasets, destination, model, tokenizer, force):
                     )
                 paths.append(path)
                 continue
-            if model is None:
-                model, tokenizer = load_model(config)
             acts = None
             for start in range(0, len(rows), config.batch_size):
                 batch = rows[start : start + config.batch_size]

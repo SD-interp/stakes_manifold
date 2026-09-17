@@ -6,24 +6,42 @@ length is signed slice length.
 
 ## Run
 
+The pipeline runs in two passes, so the expensive half is paid for once.
+
 ```powershell
 python -m pip install -r requirements.txt
-python -m jupyterlab notebooks/arc_length_pipeline.ipynb
+python -m jupyterlab notebooks/arc_length_cache.ipynb    # 1. GPU
+python -m jupyterlab notebooks/arc_length_surface.ipynb  # 2. CPU
 ```
 
-Run `notebooks/arc_length_pipeline.ipynb` top to bottom on a local GPU machine. Everything
-runs and is stored locally; nothing is uploaded. Its config cell selects the model, batch size, and
-stakes class-merging dict; layer, position, corpora, and `FORCE` are set there too.
-Stages: load model, generate prompts, cache activations, BCPC target, PLS, centroid-plane
-rotation, surface fit, stated-row projection, slice cache, arc lengths, export, plots.
+**1. `notebooks/arc_length_cache.ipynb` needs a GPU.** For every model in its `MODELS` list it
+generates the prompt corpora, caches the layer outputs the surface is fitted from, caches the
+activations of every inference corpus, and generates the stated-stakes rating continuations.
+Each model is loaded exactly once and that instance serves every stage; no module in `scripts/`
+loads weights on its own. Its config cell selects the models, batch size, stakes class-merging
+dict, corpora, weights cache directory, rating corpora, and `FORCE`; the layer is
+`floor(0.6 * num_hidden_layers)` per model. It fits nothing and computes no coordinates.
+
+**2. `notebooks/arc_length_surface.ipynb` needs no GPU, no weights and no network.** For every
+model it finds under `ARTIFACT_ROOT` it fits the BCPC target, PLS, centroid-plane rotation and
+height-slice surface from the cached activations, exports and plots the surface, projects every
+cached inference corpus through it, and parses the cached rating continuations into CSVs. Each
+model describes itself through the `run_config.json` the caching pass wrote, so the layer,
+position, batch size and stakes merges are never retyped.
+
+Everything runs and is stored locally; nothing is uploaded. The two passes can run on one
+machine or on two: to split them, copy `artifacts/<model name>/` off the GPU host. Changing a
+merge rule, a slice setting or a rating parse rule means re-running the second pass only.
 
 ## Artifacts
 
 Everything generated for a model lives under `artifacts/<model name>/`, e.g.
 `artifacts/Qwen3-4B-Instruct-2507/`:
 
+- `run_config.json` - the settings the caching pass used, which the analysis pass reads back
 - `datasets/` - prompt JSON per corpus
 - `activations/` - one `.pt` cache per corpus/template, preserving equal-file weights
+- `inference/<dataset>/` - `prompts.json`, `activations/`, `ratings/`, and the exported CSVs
 - `surface/` - `rows.parquet`, `model.npz`, `model.json`, and `slice_mapping_checkpoints/`
 - `plots/` - self-contained HTML figures: `bcpc_centroid_spline.html`,
   `pls_centroid_splines.html`, `pls_surface.html`
@@ -34,13 +52,16 @@ ones (for example after changing the layer). Compatible stated caches placed in
 
 ## Code layout
 
-All logic is in `scripts/`; the notebook only orchestrates.
+All logic is in `scripts/`; the notebooks only orchestrate.
 
 | module | role |
 |---|---|
 | `pipeline_config.py` | `RunConfig`: model, layer, batch size, stakes merges, artifact paths |
 | `prompt_datasets.py` | corpus generation and preflight checks |
 | `cache_activations.py` | model loading and per-template activation caching |
+| `inference_datasets.py` | ordered registry of the inference corpora both passes walk |
+| `inference_projection.py` | the caching and projection halves of every inference corpus |
+| `stated_stakes.py` | rating continuations: generation on the GPU, parsing anywhere |
 | `cache_inventory.py` | cache inventory and checked batch reads |
 | `bcpc_arc_length.py` | between-class PCA and `bcpc_arc_length` |
 | `pls_fit.py` | weighted single-target PLS from streamed cross-products |
@@ -56,10 +77,10 @@ prefix, via the loader, chat tokenizer, and temporary hooks in `utils/mech_inter
 
 ## Severity inference
 
-The final notebook section generates 20 templates with editable substitution lists in
+The reference severity dataset has editable substitution lists in
 `scripts/corpora/inference/severity_prompts.py`. These prompts have no severity labels and never
-enter fitting or slice-grid construction. After surface export, it caches their
-activations and applies the frozen PLS transform and saved slice mapper.
+enter fitting or slice-grid construction. The caching pass caches their activations; after
+surface export, the analysis pass applies the frozen PLS transform and saved slice mapper.
 
 Outputs live under `artifacts/<model name>/inference/severity/`: `prompts.json`,
 `activations/`, and `severity_arc_lengths.csv`. Keep these caches outside the main
@@ -68,12 +89,12 @@ Outputs live under `artifacts/<model name>/inference/severity/`: `prompts.json`,
 The CSV has exactly `template`, `severity_word`, `arc_length_parallel`, and
 `arc_length_orthogonal`; `template` is the unfilled sentence. Compatible activation
 caches are reused, while coordinates are recomputed against the current surface.
-The model loads only when caching requires it. The notebook reports projection
+Projection never loads a model. The analysis notebook reports projection
 diagnostics, including prompts outside saved height coverage, which snap to the nearest
 saved slice. `arc_length_orthogonal` retains its legacy meaning of snapped PLS3 height.
 
-The next notebook section runs the counterfactual dataset in
-`scripts/corpora/inference/severity_flipped_prompts.py`. It preserves all 20 reference families,
+The counterfactual dataset in
+`scripts/corpora/inference/severity_flipped_prompts.py` preserves all 20 reference families,
 domains, slot values, and their original row order. In each fixed compound incident, the
 substituted harm is the only one successfully mitigated and all other harms remain
 unresolved. The expected residual-stakes direction is therefore decreasing across the
@@ -104,7 +125,7 @@ independent `severity_pairwise_inference` activation namespace, and
 `severity_pairwise_arc_lengths.csv`. The CSV schema matches the other substitution-based
 severity datasets, and projection uses the frozen saved bundle without entering fitting.
 
-The following notebook section runs a wording-based dataset: 20 fixed tasks
+A wording-based dataset provides 20 fixed tasks
 with eight initial variants each (160 prompts), defined in
 `scripts/corpora/inference/severity_wording_prompts.py`. Each group's `variants` list is independent
 and can be edited or extended without changing other groups. These are expressions of
@@ -124,5 +145,7 @@ Its outputs are isolated under `artifacts/<model name>/inference/context/`, incl
 `task`, `context`, `prompt`, `arc_length_parallel`, and `arc_length_orthogonal`, and the
 activation namespace is `context_inference`.
 
-All five datasets share frozen projection and export logic in `scripts/inference_projection.py`;
-none contributes to fitting or slice coverage, and each reuses only its own caches.
+Every inference dataset shares the frozen projection and export logic in
+`scripts/inference_projection.py` and is listed once in `scripts/inference_datasets.py`, which
+both passes walk; none contributes to fitting or slice coverage, and each reuses only its own
+caches.

@@ -1,7 +1,15 @@
-"""Shared inference-only caching, frozen projection and CSV export."""
+"""Shared inference-only caching, frozen projection and CSV export.
+
+The pipeline runs in two halves. `InferenceDataset.cache` is the GPU half: it writes
+the prompts and one activation cache per template, and needs no surface. `project` is
+the CPU half: it reads those caches and maps them through the saved surface bundle.
+`run` is both, for a host that has the model and an exported surface at the same time.
+"""
 import gc
 import json
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -73,38 +81,83 @@ def project_caches(config, records, paths, *, row_fields, csv_columns, bundle=No
     return result, diagnostics
 
 
-def run(config, *, build_records, dataset_name, cache_namespace, csv_name,
-        row_fields, csv_columns, force=False, model=None, tokenizer=None):
-    """Generate/cache/project all prompts; return CSV path, rows and diagnostics.
+@dataclass(frozen=True)
+class InferenceDataset:
+    """One inference corpus and the two halves the pipeline runs it in.
 
-    Activation caches are reusable; coordinates always use the current saved bundle.
-    No fitting pipeline or fitting inventory is invoked. A caller that already holds
-    a loaded model passes it (with its tokenizer) so several datasets share one load;
-    the model is left loaded, and only caller-free memory is reclaimed here.
+    `name` is the directory under `artifacts/<model>/inference/`, `label` is the
+    heading the notebooks print, and `cache_namespace` keeps the activations of one
+    corpus from ever being mistaken for another's or for a fitting cache.
     """
-    import torch
-    bundle = load_surface_bundle(config.surface_dir)
-    _check_bundle(config, bundle[1])
-    directory = config.run_dir / 'inference' / dataset_name
-    directory.mkdir(parents=True, exist_ok=True)
-    records = build_records()
-    prompt_path = directory / 'prompts.json'
-    temporary = prompt_path.with_suffix('.json.tmp')
-    temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
-    temporary.replace(prompt_path)
-    try:
-        paths = cache_activations.run_inference(config, records, directory / 'activations',
-                                               model=model, tokenizer=tokenizer,
-                                               force=force, namespace=cache_namespace)
-    finally:
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    result, diagnostics = project_caches(config, records, paths, row_fields=row_fields,
-                                         csv_columns=csv_columns, bundle=bundle)
-    csv_path = directory / csv_name
-    temporary = csv_path.with_suffix('.csv.tmp')
-    result.to_csv(temporary, index=False, encoding='utf-8')
-    temporary.replace(csv_path)
-    print(f'Saved {len(result)} inference rows to {csv_path}')
-    return csv_path, result, diagnostics
+
+    name: str
+    label: str
+    cache_namespace: str
+    csv_name: str
+    build_records: Callable[[], list]
+    row_fields: Callable[[dict], dict]
+    csv_columns: Sequence[str]
+
+    def directory(self, config):
+        return config.run_dir / 'inference' / self.name
+
+    def cache(self, config, model, tokenizer, force=False):
+        """GPU half: write `prompts.json` and one activation cache per template.
+
+        No surface is loaded, so this runs before anything has been fitted. Existing
+        caches are reused after a fingerprint check; a mismatch raises unless `force`.
+        """
+        import torch
+        directory = self.directory(config)
+        directory.mkdir(parents=True, exist_ok=True)
+        records = self.build_records()
+        _write_json(directory / 'prompts.json', records)
+        try:
+            return cache_activations.run_inference(
+                config, records, directory / 'activations', model=model,
+                tokenizer=tokenizer, force=force, namespace=self.cache_namespace)
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def project(self, config, bundle=None):
+        """CPU half: map the cached activations through the saved surface bundle.
+
+        Returns the CSV path, its rows and the projection diagnostics. No model, no
+        fitting pipeline and no fitting inventory is involved; coordinates always come
+        from the bundle currently in `config.surface_dir`.
+        """
+        records = self.build_records()
+        directory = self.directory(config)
+        paths = cache_activations.cached_paths(
+            config, records, directory / 'activations', self.cache_namespace)
+        result, diagnostics = self.project_caches(config, records, paths, bundle)
+        csv_path = directory / self.csv_name
+        temporary = csv_path.with_suffix('.csv.tmp')
+        result.to_csv(temporary, index=False, encoding='utf-8')
+        temporary.replace(csv_path)
+        print(f'Saved {len(result)} inference rows to {csv_path}')
+        return csv_path, result, diagnostics
+
+    def project_caches(self, config, records, paths, bundle=None):
+        return project_caches(config, records, paths, row_fields=self.row_fields,
+                              csv_columns=self.csv_columns, bundle=bundle)
+
+    def run(self, config, model, tokenizer, force=False):
+        """Both halves, for a host holding the model and an exported surface.
+
+        The bundle is checked before any GPU work, so an absent or mismatched surface
+        fails immediately instead of after the corpus has been cached.
+        """
+        bundle = load_surface_bundle(config.surface_dir)
+        _check_bundle(config, bundle[1])
+        self.cache(config, model, tokenizer, force=force)
+        return self.project(config, bundle=bundle)
+
+
+def _write_json(path, payload):
+    temporary = path.with_suffix('.json.tmp')
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    temporary.replace(path)
+    return path

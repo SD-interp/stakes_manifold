@@ -9,13 +9,13 @@ def _row_fields(record):
     return dict(task=record['task'], prompt=record['text'])
 
 
-def project_caches(config, records, paths, bundle=None):
-    return inference_projection.project_caches(
-        config, records, paths, row_fields=_row_fields, csv_columns=CSV_COLUMNS, bundle=bundle)
+DATASET = inference_projection.InferenceDataset(
+    name='severity_wording', label='Severity wording', cache_namespace='severity_wording_inference',
+    csv_name='severity_wording_arc_lengths.csv', build_records=build_prompt_records,
+    row_fields=_row_fields, csv_columns=CSV_COLUMNS)
 
-
-def run(config, force=False, model=None, tokenizer=None):
-    return inference_projection.run(
-        config, build_records=build_prompt_records, dataset_name='severity_wording',
-        cache_namespace='severity_wording_inference', csv_name='severity_wording_arc_lengths.csv',
-        row_fields=_row_fields, csv_columns=CSV_COLUMNS, force=force, model=model, tokenizer=tokenizer)
+# The corpus is one object; these are the names the notebooks and tests call it by.
+cache = DATASET.cache
+project = DATASET.project
+run = DATASET.run
+project_caches = DATASET.project_caches

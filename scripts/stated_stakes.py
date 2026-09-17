@@ -23,9 +23,10 @@ and the arc-length table join positionally on it.
 
 Generations are cached per template group under
 `artifacts/<model>/inference/<dataset>/ratings/` and reused after a fingerprint
-check, in the same way activation caches are.
+check, in the same way activation caches are. The pass splits the same way the rest
+of the pipeline does: `cache` generates the continuations on the GPU, and `export`
+parses those caches into CSVs on any machine.
 """
-import gc
 import json
 from pathlib import Path
 
@@ -65,30 +66,6 @@ DATASETS = {
 }
 
 
-class LazyModel:
-    """Load the model at most once, and only if some generation is still missing."""
-
-    def __init__(self, config, model=None, tokenizer=None):
-        if (model is None) != (tokenizer is None):
-            raise ValueError('Supply both model and tokenizer, or neither.')
-        self.config, self.model, self.tokenizer = config, model, tokenizer
-        self.borrowed = model is not None
-
-    def get(self):
-        if self.model is None:
-            self.model, self.tokenizer = cache_activations.load_model(self.config)
-        return self.model, self.tokenizer
-
-    def release(self):
-        """Free a model this handle loaded itself; never free a borrowed one."""
-        if not self.borrowed:
-            self.model = self.tokenizer = None
-            gc.collect()
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-
 def build_rating_records(records, phrasings=PHRASINGS):
     """Wrap every corpus prompt in every phrasing, preserving source row order."""
     check_phrasings()
@@ -117,9 +94,8 @@ def build_rating_records(records, phrasings=PHRASINGS):
     return rating_records
 
 
-def generation_config(config, handle, max_new_tokens):
-    device = (cache_activations.resolve_device(config) if handle.model is None
-              else str(handle.model.device))
+def generation_config(config, model, max_new_tokens):
+    device = str(model.device)
     return dict(
         model_name=config.model_name,
         dtype=cache_activations.activation_dtype(device),
@@ -135,9 +111,8 @@ def generation_config(config, handle, max_new_tokens):
     )
 
 
-def _generate_batch(handle, texts, max_new_tokens):
+def _generate_batch(model, tokenizer, texts, max_new_tokens):
     import torch
-    model, tokenizer = handle.get()
     inputs = {key: value.to(model.device) for key, value in tokenizer(texts).items()}
     prompt_length = inputs['input_ids'].shape[1]
     with torch.inference_mode():
@@ -151,16 +126,19 @@ def _generate_batch(handle, texts, max_new_tokens):
             list(tokenizer.batch_decode(generated, skip_special_tokens=True)))
 
 
-def generate(config, rating_records, destination, handle, force=False,
+def generate(config, rating_records, destination, model, tokenizer, force=False,
              max_new_tokens=GENERATED_TOKENS):
     """Cache one JSON file of continuations per template group; return the paths."""
+    if model is None or tokenizer is None:
+        raise ValueError('A loaded model and tokenizer are required; this module '
+                         'never loads one itself.')
     destination = Path(destination).resolve()
     fitting = config.activations_dir.resolve()
     if destination == fitting or fitting in destination.parents:
         raise ValueError('Rating caches must be outside the fitting activations directory.')
     if not rating_records:
         raise ValueError('Rating records must not be empty.')
-    settings = generation_config(config, handle, max_new_tokens)
+    settings = generation_config(config, model, max_new_tokens)
     destination.mkdir(parents=True, exist_ok=True)
     groups = cache_activations.template_groups(rating_records)
     paths = []
@@ -185,7 +163,7 @@ def generate(config, rating_records, destination, handle, force=False,
         for start in range(0, len(rows), config.batch_size):
             batch = rows[start:start + config.batch_size]
             batch_tokens, batch_texts = _generate_batch(
-                handle, [row['text'] for row in batch], max_new_tokens)
+                model, tokenizer, [row['text'] for row in batch], max_new_tokens)
             tokens.extend(batch_tokens)
             texts.extend(batch_texts)
         payload = dict(config=settings, prompts=[row['text'] for row in rows],
@@ -249,33 +227,50 @@ def _write_csv(table, path):
     return path
 
 
-def run(config, dataset_name, build_records=None, force=False, model=None, tokenizer=None,
-        max_new_tokens=GENERATED_TOKENS, handle=None):
-    """Rate one corpus; return the CSV paths, the long table and the per-prompt summary."""
+def _records_for(dataset_name, build_records):
     if build_records is None:
         if dataset_name not in DATASETS:
             raise ValueError(f'Unknown rating dataset {dataset_name!r}; '
                              f'expected one of {sorted(DATASETS)}')
         build_records = DATASETS[dataset_name]
-    owned = handle is None
-    handle = LazyModel(config, model, tokenizer) if owned else handle
-    directory = config.run_dir / 'inference' / dataset_name
-    ratings_dir = directory / 'ratings'
-    ratings_dir.mkdir(parents=True, exist_ok=True)
-    rating_records = build_rating_records(build_records())
-    prompt_path = ratings_dir / 'prompts.json'
+    return build_rating_records(build_records())
+
+
+def ratings_dir(config, dataset_name):
+    return config.run_dir / 'inference' / dataset_name / 'ratings'
+
+
+def cache(config, dataset_name, build_records=None, *, model, tokenizer, force=False,
+          max_new_tokens=GENERATED_TOKENS):
+    """GPU half: write the rating prompts and generate every continuation.
+
+    The caller owns the model, so rating a corpus never loads one of its own.
+    """
+    rating_records = _records_for(dataset_name, build_records)
+    destination = ratings_dir(config, dataset_name)
+    destination.mkdir(parents=True, exist_ok=True)
+    prompt_path = destination / 'prompts.json'
     temporary = prompt_path.with_suffix('.json.tmp')
     temporary.write_text(json.dumps(rating_records, ensure_ascii=False, indent=2),
                          encoding='utf-8')
     temporary.replace(prompt_path)
-    try:
-        paths = generate(config, rating_records, ratings_dir, handle, force=force,
-                         max_new_tokens=max_new_tokens)
-    finally:
-        if owned:
-            handle.release()
+    return generate(config, rating_records, destination, model, tokenizer, force=force,
+                    max_new_tokens=max_new_tokens)
+
+
+def export(config, dataset_name, build_records=None):
+    """CPU half: parse the cached continuations into the two rating CSVs.
+
+    Parsing is deliberately separate from generation: the caches keep the decoded text
+    and the raw token ids, so a changed parse rule is re-exported without a GPU.
+    """
+    rating_records = _records_for(dataset_name, build_records)
+    destination = ratings_dir(config, dataset_name)
+    paths = cache_activations.cached_paths(config, rating_records, destination,
+                                           'ratings', suffix='.json')
     table = collect(rating_records, paths)
     summary = summarise(table)
+    directory = config.run_dir / 'inference' / dataset_name
     csv_path = _write_csv(table[CSV_COLUMNS], directory / 'stated_stakes.csv')
     summary_path = _write_csv(summary, directory / 'stated_stakes_summary.csv')
     parsed = int(table['rating'].notna().sum())
@@ -284,20 +279,47 @@ def run(config, dataset_name, build_records=None, force=False, model=None, token
     return csv_path, summary_path, table, summary
 
 
-def run_all(config, names=None, force=False, max_new_tokens=GENERATED_TOKENS):
-    """Rate several corpora, loading the model at most once for all of them."""
+def run(config, dataset_name, build_records=None, *, model, tokenizer, force=False,
+        max_new_tokens=GENERATED_TOKENS):
+    """Both halves for one corpus; return the CSV paths, the table and the summary."""
+    cache(config, dataset_name, build_records, model=model, tokenizer=tokenizer,
+          force=force, max_new_tokens=max_new_tokens)
+    return export(config, dataset_name, build_records)
+
+
+def _checked_names(names):
     names = list(DATASETS) if names is None else list(names)
     unknown = [name for name in names if name not in DATASETS]
     if unknown:
         raise ValueError(f'Unknown rating datasets {unknown}; expected {sorted(DATASETS)}')
-    handle, results = LazyModel(config), {}
-    try:
-        for name in names:
-            results[name] = run(config, name, force=force, handle=handle,
-                                max_new_tokens=max_new_tokens)
-    finally:
-        handle.release()
-    return results
+    return names
+
+
+def cached_datasets(config, names=None):
+    """The rating corpora the caching half has already generated for this model."""
+    return [name for name in _checked_names(names)
+            if any(ratings_dir(config, name).glob('ratings--*.json'))]
+
+
+def cache_all(config, names=None, *, model, tokenizer, force=False,
+              max_new_tokens=GENERATED_TOKENS):
+    """Generate several corpora's continuations with the model the caller holds."""
+    return {name: cache(config, name, model=model, tokenizer=tokenizer, force=force,
+                        max_new_tokens=max_new_tokens)
+            for name in _checked_names(names)}
+
+
+def export_all(config, names=None):
+    """Parse several corpora's cached continuations into their CSVs."""
+    return {name: export(config, name) for name in _checked_names(names)}
+
+
+def run_all(config, names=None, *, model, tokenizer, force=False,
+            max_new_tokens=GENERATED_TOKENS):
+    """Rate several corpora with the model the caller already holds."""
+    return {name: run(config, name, model=model, tokenizer=tokenizer, force=force,
+                      max_new_tokens=max_new_tokens)
+            for name in _checked_names(names)}
 
 
 def parse_rate(table):
