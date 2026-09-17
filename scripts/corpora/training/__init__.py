@@ -4,7 +4,8 @@
 schema and base task set that `horizon_free_task_set` builds on. Note the names of the
 two original corpora are historical and describe the opposite of their contents:
 
-    conversational_no_time -> bare prompts, 3 templates  ("Task: X\n\nWrite a plan.")
+    conversational_no_time -> bare prompts, 3 templates  ("Task: X\n\nWrite a plan.",
+                              a planning brief, and a working-notes heading)
     task_only              -> conversational prompts, 12 templates
                               ("Could you help me plan how to X?")
 

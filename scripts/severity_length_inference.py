@@ -2,8 +2,8 @@
 from . import inference_projection
 from .corpora.inference.severity_length_prompts import build_prompt_records
 
-CSV_COLUMNS = ['template', 'severity_word', 'pad_level', 'pad_position', 'pad_words',
-               'arc_length_parallel', 'arc_length_orthogonal']
+CSV_COLUMNS = ['template', 'severity_word', 'pad_level', 'pad_variant', 'pad_position',
+               'pad_words', 'arc_length_parallel', 'arc_length_orthogonal']
 
 
 def _row_fields(record):
@@ -11,6 +11,7 @@ def _row_fields(record):
     return dict(template=record['template_metadata']['template'],
                 severity_word=metadata['severity_word'],
                 pad_level=metadata['pad_level'],
+                pad_variant=metadata['pad_variant'],
                 pad_position=metadata['pad_position'],
                 pad_words=metadata['pad_words'])
 

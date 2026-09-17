@@ -1,3 +1,4 @@
+import collections
 import copy
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -19,13 +20,14 @@ from scripts import (cache_activations, context_inference, severity_composition_
                      severity_flipped_inference,
                      severity_inference, severity_length_inference,
                      severity_magnitude_inference, severity_null_inference,
-                     severity_pairwise_inference, severity_wording_inference, stated_stakes)
+                     severity_pairwise_inference, severity_verb_inference,
+                     severity_wording_inference, stated_stakes)
 from scripts.corpora.inference import (context_prompts, rating_phrasings,
                             severity_composition_prompts, severity_flipped_prompts,
                             severity_magnitude_prompts,
                             severity_length_prompts,
                             severity_null_prompts, severity_pairwise_prompts,
-                            severity_wording_prompts)
+                            severity_verb_prompts, severity_wording_prompts)
 from scripts.cache_inventory import CacheInventory
 from scripts.corpora.inference.severity_prompts import TEMPLATES, build_prompt_records
 from scripts.pipeline_config import RunConfig, NO_TIME_CORPORA
@@ -119,7 +121,8 @@ class SeverityTests(unittest.TestCase):
         self.assertLess(code.index('severity_composition_inference.run('), code.index('severity_flipped_inference.run('))
         self.assertLess(code.index('severity_flipped_inference.run('), code.index('severity_pairwise_inference.run('))
         self.assertLess(code.index('severity_pairwise_inference.run('), code.index('severity_wording_inference.run('))
-        self.assertLess(code.index('severity_wording_inference.run('), code.index('context_inference.run('))
+        self.assertLess(code.index('severity_wording_inference.run('), code.index('severity_verb_inference.run('))
+        self.assertLess(code.index('severity_verb_inference.run('), code.index('context_inference.run('))
         # Generation runs last: it reloads the model, and by then every CSV is exported.
         self.assertLess(code.index('context_inference.run('), code.index('stated_stakes.run_all('))
 
@@ -283,15 +286,18 @@ class SeverityTests(unittest.TestCase):
 
     def test_length_dataset_crosses_severity_with_inert_padding(self):
         families = severity_length_prompts.FAMILIES
-        ladder = severity_length_prompts.padding_ladder()
+        variants = severity_length_prompts.VARIANT_ORDER
         positions = severity_length_prompts.POSITIONS
+        ladders = {variant: severity_length_prompts.padding_ladder(variant)
+                   for variant in variants}
         records = severity_length_prompts.build_prompt_records()
         reference = {template[0]: template for template in TEMPLATES}
         values = sum(len(family[3]) for family in families)
-        placements = 1 + (len(ladder) - 1) * len(positions)
-        self.assertEqual((len(families), len(ladder)), (6, 5))
+        levels = len(ladders[variants[0]])
+        placements = 1 + (levels - 1) * len(positions) * len(variants)
+        self.assertEqual((len(families), levels, len(variants)), (6, 5, 2))
         self.assertEqual(len(records), values * placements)
-        self.assertEqual(len(records), 306)
+        self.assertEqual(len(records), 578)
         self.assertEqual(len({record['text'] for record in records}), len(records))
 
         # The request is the reference request, untouched: only padding may differ.
@@ -301,12 +307,21 @@ class SeverityTests(unittest.TestCase):
             self.assertEqual((domain, template, slot_values),
                              (reference_domain, reference_template, reference_values))
 
-        # The ladder is nested and strictly lengthening, so adjacent levels differ
-        # only by the sentence that was added.
-        self.assertEqual(ladder[0], '')
-        for level in range(1, len(ladder)):
-            self.assertTrue(ladder[level].startswith(ladder[level - 1]))
-            self.assertLess(len(ladder[level - 1].split()), len(ladder[level].split()))
+        # Each ladder is nested and strictly lengthening, the two share no wording,
+        # and they are matched word for word so a difference between them is not a
+        # difference in length.
+        widths = {variant: [len(text.split()) for text in ladder]
+                  for variant, ladder in ladders.items()}
+        self.assertEqual(len(set(map(tuple, widths.values()))), 1, widths)
+        self.assertEqual(widths[variants[0]], [0, 12, 38, 64, 96])
+        sentences = [severity_length_prompts.PADDING_VARIANTS[variant] for variant in variants]
+        self.assertEqual(len(set().union(*map(set, sentences))),
+                         sum(len(group) for group in sentences))
+        for ladder in ladders.values():
+            self.assertEqual(ladder[0], '')
+            for level in range(1, len(ladder)):
+                self.assertTrue(ladder[level].startswith(ladder[level - 1]))
+                self.assertLess(len(ladder[level - 1].split()), len(ladder[level].split()))
 
         # Every severity value reaches every padding cell, which is what lets a
         # length effect be read inside a value and the ladder inside a level.
@@ -314,10 +329,13 @@ class SeverityTests(unittest.TestCase):
         for record in records:
             metadata = record['task_metadata']
             key = (record['template_id'], metadata['severity_word'])
-            cells.setdefault(key, []).append((metadata['pad_level'], metadata['pad_position']))
-        expected = sorted([(0, 'none')] + [(level, position)
-                                           for level in range(1, len(ladder))
-                                           for position in positions])
+            cells.setdefault(key, []).append((metadata['pad_level'], metadata['pad_variant'],
+                                              metadata['pad_position']))
+        expected = sorted([(0, 'none', 'none')]
+                          + [(level, variant, position)
+                             for variant in variants
+                             for level in range(1, levels)
+                             for position in positions])
         self.assertEqual(len(cells), values)
         for key, placed in cells.items():
             self.assertEqual(sorted(placed), expected, key)
@@ -325,10 +343,15 @@ class SeverityTests(unittest.TestCase):
         unpadded = {record['text'] for record in records
                     if record['task_metadata']['pad_level'] == 0}
         self.assertEqual(len(unpadded), values)
+        # Every baseline is byte-identical to a reference severity prompt, so the two
+        # datasets must project those rows to the same coordinates - a free check.
+        self.assertLess(unpadded, {record['text'] for record in self.records})
         for record in records:
             metadata = record['task_metadata']
+            padding = ('' if metadata['pad_level'] == 0
+                       else ladders[metadata['pad_variant']][metadata['pad_level']])
             self.assertIn(metadata['severity_word'], record['text'])
-            self.assertEqual(metadata['pad_words'], len(ladder[metadata['pad_level']].split()))
+            self.assertEqual(metadata['pad_words'], len(padding.split()))
             self.assertEqual(metadata['usage'], 'inference_only')
             self.assertNotIn('stakes', metadata)
             self.assertNotIn('expected_direction', metadata)
@@ -336,7 +359,6 @@ class SeverityTests(unittest.TestCase):
             # A padded prompt still carries its own baseline word for word, once,
             # and everything else in it is exactly that level's padding.
             request = next(text for text in unpadded if text in record['text'])
-            padding = ladder[metadata['pad_level']]
             self.assertEqual(record['text'].count(request), 1)
             self.assertEqual(record['text'].replace(request, '').strip(), padding)
             leading = request if metadata['pad_position'] != 'prefix' else padding
@@ -345,17 +367,111 @@ class SeverityTests(unittest.TestCase):
                           'value', 'value_text', 'unit'):
                 self.assertNotIn(field, record)
 
-        # The ladder is nested by construction, so the guards that can fire are the
-        # ones that catch an edit to the sentence list: a blank entry, which adds a
-        # level without lengthening it, and a list too short to be a ladder at all.
-        sentences = severity_length_prompts.PADDING_SENTENCES
-        blank = [sentences[0], '', *sentences[1:]]
-        with patch.object(severity_length_prompts, 'PADDING_SENTENCES', blank):
+        # The guards that can fire are edits to a sentence list: a blank entry, a
+        # list too short to be a ladder, ladders of unequal length, and a shared
+        # sentence that would stop the two variants being independent.
+        original = severity_length_prompts.PADDING_VARIANTS
+        first, second = variants
+        def swap(**changes):
+            return patch.object(severity_length_prompts, 'PADDING_VARIANTS',
+                                {**original, **changes})
+        with swap(**{first: [original[first][0], '', *original[first][1:]]}):
             with self.assertRaisesRegex(ValueError, 'is not longer than level'):
                 severity_length_prompts.build_prompt_records()
-        with patch.object(severity_length_prompts, 'PADDING_SENTENCES', sentences[:1]):
+        with swap(**{first: original[first][:1]}):
             with self.assertRaisesRegex(ValueError, 'must start empty and carry several'):
                 severity_length_prompts.build_prompt_records()
+        with swap(**{second: original[second][:-1]}):
+            with self.assertRaisesRegex(ValueError, 'do not match'):
+                severity_length_prompts.build_prompt_records()
+        with swap(**{second: list(original[first])}):
+            with self.assertRaisesRegex(ValueError, 'must not share any sentence'):
+                severity_length_prompts.build_prompt_records()
+
+    def test_verb_dataset_crosses_predicament_with_verb_frame(self):
+        predicaments = severity_verb_prompts.PREDICAMENTS
+        frames = severity_verb_prompts.VERB_FRAMES
+        moods = severity_verb_prompts.MOODS
+        records = severity_verb_prompts.build_prompt_records()
+        self.assertEqual((len(predicaments), len(frames), len(moods)), (20, 4, 2))
+        self.assertEqual(len(records), len(predicaments) * len(frames) * len(moods))
+        self.assertEqual(len(records), 160)
+        self.assertEqual(len({record['text'] for record in records}), len(records))
+
+        # Full crossing with replication: every predicament under every frame in
+        # every mood, exactly once. The replicate is what makes the interaction
+        # testable rather than indistinguishable from error.
+        cells = collections.Counter(
+            (record['template_id'], record['task_metadata']['verb_frame'],
+             record['task_metadata']['mood']) for record in records)
+        self.assertEqual(set(cells.values()), {1})
+        self.assertEqual(set(cells), {(predicament[0], frame[0], mood)
+                                      for predicament in predicaments
+                                      for frame in frames for mood in moods})
+        replicates = collections.Counter(
+            (record['template_id'], record['task_metadata']['verb_frame'])
+            for record in records)
+        self.assertEqual(set(replicates.values()), {len(moods)})
+
+        # Singular and plural must both be well represented, or a number-agreement
+        # effect would be inseparable from the few predicaments that carry it.
+        pronouns = collections.Counter(predicament[1] for predicament in predicaments)
+        self.assertEqual(set(pronouns), set(severity_verb_prompts.PRONOUNS))
+        self.assertGreaterEqual(min(pronouns.values()), len(predicaments) // 3)
+
+        situations = {predicament[0]: predicament[2] for predicament in predicaments}
+        pronoun_of = {predicament[0]: predicament[1] for predicament in predicaments}
+        requests = dict(frames)
+        by_predicament = {}
+        for record in records:
+            metadata = record['task_metadata']
+            situation = situations[record['template_id']]
+            # The situation pins the predicament, so it must survive intact and the
+            # only thing following it is that frame and mood's request.
+            self.assertTrue(record['text'].startswith(situation))
+            self.assertEqual(record['template_metadata']['situation'], situation)
+            request = requests[metadata['verb_frame']][moods.index(metadata['mood'])]
+            tail = record['text'][len(situation):].strip()
+            self.assertEqual(tail, request.format(pronoun=pronoun_of[record['template_id']]))
+            self.assertEqual(record['template_metadata']['template'], request)
+            self.assertEqual(metadata['object_pronoun'], pronoun_of[record['template_id']])
+            self.assertEqual(record['task'], record['template_id'])
+            self.assertEqual(record['template_metadata']['prompt_framing'], 'severity_verb')
+            self.assertEqual(metadata['usage'], 'inference_only')
+            self.assertNotIn('stakes', metadata)
+            self.assertNotIn('severity_word', metadata)
+            for field in ('base_value', 'base_unit', 'unit_variant', 'number_format',
+                          'value', 'value_text', 'unit'):
+                self.assertNotIn(field, record)
+            by_predicament.setdefault(record['template_id'], set()).add(tail)
+
+        # A request names the object only by pronoun, so within a predicament the
+        # prompts differ by the verb and the mood and by nothing else.
+        for predicament_id, tails in by_predicament.items():
+            self.assertEqual(len(tails), len(frames) * len(moods), predicament_id)
+            for tail in tails:
+                self.assertNotIn(predicament_id.split('_')[0], tail.lower())
+
+        nested = [(frames[0][0], [frames[0][1][0]])] + list(frames[1:])
+        with patch.object(severity_verb_prompts, 'VERB_FRAMES', nested):
+            with self.assertRaisesRegex(ValueError, 'one distinct request per mood'):
+                severity_verb_prompts.build_prompt_records()
+        broken = [(frames[0][0], ['Help me find my {object}.'] * 2)] + list(frames[1:])
+        with patch.object(severity_verb_prompts, 'VERB_FRAMES', broken):
+            with self.assertRaisesRegex(ValueError, 'one distinct request per mood'):
+                severity_verb_prompts.build_prompt_records()
+        slotted = [(frames[0][0], ['Help me find my {object}.', 'Well? {object}?'])] + list(frames[1:])
+        with patch.object(severity_verb_prompts, 'VERB_FRAMES', slotted):
+            with self.assertRaisesRegex(ValueError, 'may use only a'):
+                severity_verb_prompts.build_prompt_records()
+        objectless = [(frame[0], list(frames[-1][1])) for frame in frames]
+        with patch.object(severity_verb_prompts, 'VERB_FRAMES', objectless):
+            with self.assertRaisesRegex(ValueError, 'object-directed and situation-directed'):
+                severity_verb_prompts.build_prompt_records()
+        lopsided = [(p[0], 'it', p[2]) for p in predicaments]
+        with patch.object(severity_verb_prompts, 'PREDICAMENTS', lopsided):
+            with self.assertRaisesRegex(ValueError, 'too unbalanced to estimate'):
+                severity_verb_prompts.build_prompt_records()
 
     def test_rating_phrasings_enforce_a_parseable_shape(self):
         rating_phrasings.check_phrasings()
@@ -668,11 +784,38 @@ class SeverityTests(unittest.TestCase):
                          [record['task_metadata']['pad_level'] for record in records])
         self.assertEqual(result.pad_position.tolist(),
                          [record['task_metadata']['pad_position'] for record in records])
+        self.assertEqual(result.pad_variant.tolist(),
+                         [record['task_metadata']['pad_variant'] for record in records])
         reordered, _ = severity_length_inference.project_caches(self.config, records, paths[::-1])
         pd.testing.assert_frame_equal(result, reordered)
         fitting = (list(self.config.activations_dir.rglob('*.pt'))
                    if self.config.activations_dir.exists() else [])
         self.assertTrue(all('length' not in path.name for path in fitting))
+
+    def test_verb_inference_is_isolated_and_aligned(self):
+        records = severity_verb_prompts.build_prompt_records()
+        directory = self.config.run_dir / 'inference' / 'severity_verb'
+        with self.mock_model() as (loader, _):
+            csv, result, _ = severity_verb_inference.run(self.config)
+            self.assertEqual(loader.call_count, 1)
+            paths = sorted((directory / 'activations').glob('*.pt'))
+            self.assertEqual(len(paths), len(severity_verb_prompts.PREDICAMENTS))
+            self.assertTrue(all(path.name.startswith('severity_verb_inference--')
+                                for path in paths))
+        self.assertEqual(csv, directory / 'severity_verb_arc_lengths.csv')
+        self.assertEqual(list(pd.read_csv(csv).columns), severity_verb_inference.CSV_COLUMNS)
+        self.assertEqual(result.verb_frame.tolist(),
+                         [record['task_metadata']['verb_frame'] for record in records])
+        self.assertEqual(result.predicament.tolist(),
+                         [record['template_id'] for record in records])
+        self.assertEqual(result.mood.tolist(),
+                         [record['task_metadata']['mood'] for record in records])
+        self.assertEqual(result.prompt.tolist(), [record['text'] for record in records])
+        reordered, _ = severity_verb_inference.project_caches(self.config, records, paths[::-1])
+        pd.testing.assert_frame_equal(result, reordered)
+        fitting = (list(self.config.activations_dir.rglob('*.pt'))
+                   if self.config.activations_dir.exists() else [])
+        self.assertTrue(all('verb' not in path.name for path in fitting))
 
     def test_hf_cache_dir_is_validated_and_reaches_the_loader(self):
         """None must mean the Hugging Face default; a path must reach every download."""
@@ -706,6 +849,7 @@ class SeverityTests(unittest.TestCase):
                    (severity_flipped_inference, 'severity_flipped'),
                    (severity_pairwise_inference, 'severity_pairwise'),
                    (severity_wording_inference, 'severity_wording'),
+                   (severity_verb_inference, 'severity_verb'),
                    (context_inference, 'context')]
         with self.mock_model() as (loader, _):
             model, tokenizer = loader.return_value

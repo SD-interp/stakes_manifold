@@ -8,8 +8,8 @@ same voice fill the register out.
 
 This is a distinct register from the existing horizon-free corpora: it addresses
 the model directly in the imperative with the task inline, where
-``conversational_no_time`` uses a labelled field form and ``task_only`` asks a
-first-person question.
+``conversational_no_time`` states the task in an unaddressed written brief and
+``task_only`` asks a first-person question.
 
 Because no template interpolates ``{value}`` or ``{unit}``, the time grid is a
 single placeholder value; iterating a wider grid would emit byte-identical

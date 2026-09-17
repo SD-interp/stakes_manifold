@@ -39,19 +39,39 @@ diagnostics reports that per row and should be read before the top two levels ar
 
 from string import Formatter
 
-# Inert sentences, added one at a time. None of them mentions the request, an
-# outcome, a quantity or a deadline, and their order is fixed so that the ladder
-# below is nested. Deliberately mundane: padding has to be long without being
-# about anything.
-PADDING_SENTENCES = [
-    "I am typing this out on my laptop at the kitchen table.",
-    "The window beside me looks out on the same row of houses it always has, and "
-    "the paint on the sill could do with another coat.",
-    "My neighbour has been practising the same four bars on his trumpet since "
-    "about ten this morning, with no sign of moving on to the fifth.",
-    "There is a mug of tea next to the keyboard that I made a while ago and then "
-    "forgot about, and it has gone the colour tea goes when you do that.",
-]
+# Two independent ladders of inert sentences, added one at a time. None mentions
+# the request, an outcome, a quantity or a deadline, and each list's order is fixed
+# so that its ladder is nested. Deliberately mundane: padding has to be long
+# without being about anything.
+#
+# There are two because one would not be enough. With a single ladder, "the
+# coordinate moved when the prompt got longer" and "the coordinate moved when
+# these particular four sentences were added" are the same statement. The two
+# ladders share no wording and are matched word for word at every level, so a
+# length effect that appears under both is a length effect, and one that appears
+# under only one is a property of that text. ``pad_variant`` carries which.
+PADDING_VARIANTS = {
+    "kitchen": [
+        "I am typing this out on my laptop at the kitchen table.",
+        "The window beside me looks out on the same row of houses it always has, and "
+        "the paint on the sill could do with another coat.",
+        "My neighbour has been practising the same four bars on his trumpet since "
+        "about ten this morning, with no sign of moving on to the fifth.",
+        "There is a mug of tea next to the keyboard that I made a while ago and then "
+        "forgot about, and it has gone the colour tea goes when you do that.",
+    ],
+    "commute": [
+        "I am writing this on my phone on the way to work.",
+        "The train has been sitting outside the station for a while now and the "
+        "announcements have stopped explaining why, which is fairly normal for this line.",
+        "Someone further down the carriage is eating something that smells strongly of "
+        "vinegar, and the man opposite me has been asleep since the very first stop.",
+        "My bag is on the seat beside me with a paperback in it that I have been meaning "
+        "to finish since about March, and I have not opened it once today either.",
+    ],
+}
+
+VARIANT_ORDER = list(PADDING_VARIANTS)
 
 # Where the padding sits relative to the request. Level 0 carries neither.
 POSITIONS = ["prefix", "suffix"]
@@ -123,33 +143,53 @@ FAMILIES = [
 ]
 
 
-def padding_ladder():
+def padding_ladder(variant=None):
     """Cumulative padding text per level, shortest first, starting at the empty string."""
-    return [
-        " ".join(PADDING_SENTENCES[:level])
-        for level in range(len(PADDING_SENTENCES) + 1)
-    ]
+    sentences = PADDING_VARIANTS[VARIANT_ORDER[0] if variant is None else variant]
+    return [" ".join(sentences[:level]) for level in range(len(sentences) + 1)]
 
 
-def build_prompt_records():
-    """Emit one record per value, padding level and position; no stakes labels."""
-    if len(FAMILIES) != 6 or len({family[0] for family in FAMILIES}) != 6:
-        raise ValueError("Expected exactly 6 uniquely identified families.")
-    if len(POSITIONS) != 2 or set(POSITIONS) != {"prefix", "suffix"}:
-        raise ValueError("Expected exactly the prefix and suffix positions.")
-    ladder = padding_ladder()
+def _check_ladder(variant):
+    """A variant's ladder, validated as nested and strictly lengthening."""
+    ladder = padding_ladder(variant)
     if len(ladder) < 3 or ladder[0] != "":
         raise ValueError("The padding ladder must start empty and carry several levels.")
     for level, padding in enumerate(ladder[1:], start=1):
         # Nesting is the whole point: adjacent levels differ only by an addition.
         if not padding.startswith(ladder[level - 1]):
             raise ValueError(
-                f"Padding level {level} is not an extension of level {level - 1}."
+                f"{variant}: padding level {level} is not an extension of level {level - 1}."
             )
         if len(padding.split()) <= len(ladder[level - 1].split()):
             raise ValueError(
-                f"Padding level {level} is not longer than level {level - 1}."
+                f"{variant}: padding level {level} is not longer than level {level - 1}."
             )
+    return ladder
+
+
+def build_prompt_records():
+    """Emit one record per value, padding level, variant and position; no stakes labels."""
+    if len(FAMILIES) != 6 or len({family[0] for family in FAMILIES}) != 6:
+        raise ValueError("Expected exactly 6 uniquely identified families.")
+    if len(POSITIONS) != 2 or set(POSITIONS) != {"prefix", "suffix"}:
+        raise ValueError("Expected exactly the prefix and suffix positions.")
+    if len(VARIANT_ORDER) < 2:
+        raise ValueError("A single padding ladder cannot separate length from wording.")
+    ladders = {variant: _check_ladder(variant) for variant in VARIANT_ORDER}
+    lengths = {variant: [len(text.split()) for text in ladder]
+               for variant, ladder in ladders.items()}
+    reference = lengths[VARIANT_ORDER[0]]
+    for variant in VARIANT_ORDER[1:]:
+        # Matched word for word at every level, or the variants are not comparable
+        # and a difference between them could just be a difference in length.
+        if lengths[variant] != reference:
+            raise ValueError(
+                f"{variant}: padding lengths {lengths[variant]} do not match {reference}."
+            )
+    if len(set.union(*(set(PADDING_VARIANTS[v]) for v in VARIANT_ORDER))) != sum(
+        len(PADDING_VARIANTS[v]) for v in VARIANT_ORDER
+    ):
+        raise ValueError("Padding variants must not share any sentence.")
 
     records, seen = [], set()
     for family_id, domain, template, values in FAMILIES:
@@ -164,37 +204,38 @@ def build_prompt_records():
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{family_id}: invalid slot value.")
             request = template.format(**{fields[0]: value})
-            for level, padding in enumerate(ladder):
-                # Level 0 is the shared unpadded baseline and carries no position.
-                placements = (
-                    [("none", request)]
-                    if level == 0
-                    else [
-                        ("prefix", f"{padding} {request}"),
-                        ("suffix", f"{request} {padding}"),
-                    ]
-                )
-                for position, text in placements:
-                    if text in seen or "{" in text or "}" in text or request not in text:
-                        raise ValueError(f"Duplicate, unfilled, or altered prompt: {text}")
-                    seen.add(text)
-                    records.append(
-                        dict(
-                            text=text,
-                            template_id=family_id,
-                            template_metadata={
-                                "template": template,
-                                "domain": domain,
-                                "prompt_framing": "severity_length",
-                            },
-                            task=family_id,
-                            task_metadata={
-                                "severity_word": value,
-                                "pad_level": level,
-                                "pad_position": position,
-                                "pad_words": len(padding.split()),
-                                "usage": "inference_only",
-                            },
-                        )
+            # Level 0 is the shared unpadded baseline: one row, no position and no
+            # variant, because an empty prefix and an empty suffix are the same prompt.
+            placements = [("none", "none", 0, request)]
+            for variant in VARIANT_ORDER:
+                for level, padding in enumerate(ladders[variant]):
+                    if level == 0:
+                        continue
+                    placements.append((variant, "prefix", level, f"{padding} {request}"))
+                    placements.append((variant, "suffix", level, f"{request} {padding}"))
+            for variant, position, level, text in placements:
+                if text in seen or "{" in text or "}" in text or request not in text:
+                    raise ValueError(f"Duplicate, unfilled, or altered prompt: {text}")
+                seen.add(text)
+                padding = "" if level == 0 else ladders[variant][level]
+                records.append(
+                    dict(
+                        text=text,
+                        template_id=family_id,
+                        template_metadata={
+                            "template": template,
+                            "domain": domain,
+                            "prompt_framing": "severity_length",
+                        },
+                        task=family_id,
+                        task_metadata={
+                            "severity_word": value,
+                            "pad_level": level,
+                            "pad_variant": variant,
+                            "pad_position": position,
+                            "pad_words": len(padding.split()),
+                            "usage": "inference_only",
+                        },
                     )
+                )
     return records
