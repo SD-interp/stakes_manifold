@@ -28,7 +28,7 @@ def project_caches(config, records, paths, bundle=None):
         csv_columns=CSV_COLUMNS, bundle=bundle)
 
 
-def run(config, force=False):
+def run(config, force=False, model=None, tokenizer=None):
     return inference_projection.run(
         config,
         build_records=build_prompt_records,
@@ -38,4 +38,6 @@ def run(config, force=False):
         row_fields=_row_fields,
         csv_columns=CSV_COLUMNS,
         force=force,
+        model=model,
+        tokenizer=tokenizer,
     )

@@ -74,11 +74,13 @@ def project_caches(config, records, paths, *, row_fields, csv_columns, bundle=No
 
 
 def run(config, *, build_records, dataset_name, cache_namespace, csv_name,
-        row_fields, csv_columns, force=False):
+        row_fields, csv_columns, force=False, model=None, tokenizer=None):
     """Generate/cache/project all prompts; return CSV path, rows and diagnostics.
 
     Activation caches are reusable; coordinates always use the current saved bundle.
-    No fitting pipeline or fitting inventory is invoked.
+    No fitting pipeline or fitting inventory is invoked. A caller that already holds
+    a loaded model passes it (with its tokenizer) so several datasets share one load;
+    the model is left loaded, and only caller-free memory is reclaimed here.
     """
     import torch
     bundle = load_surface_bundle(config.surface_dir)
@@ -91,7 +93,9 @@ def run(config, *, build_records, dataset_name, cache_namespace, csv_name,
     temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
     temporary.replace(prompt_path)
     try:
-        paths = cache_activations.run_inference(config, records, directory / 'activations', force=force, namespace=cache_namespace)
+        paths = cache_activations.run_inference(config, records, directory / 'activations',
+                                               model=model, tokenizer=tokenizer,
+                                               force=force, namespace=cache_namespace)
     finally:
         gc.collect()
         if torch.cuda.is_available():

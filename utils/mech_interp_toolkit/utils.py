@@ -46,6 +46,7 @@ def load_model_tokenizer_config(
     attn_type: str = "sdpa",
     suffix: str = "",
     system_prompt: str = "",
+    cache_dir: str | None = None,
 ) -> Tuple[PreTrainedModel, ChatTemplateTokenizer, PretrainedConfig]:
     """
     Load a Hugging Face model, tokenizer, and config by name.
@@ -57,6 +58,7 @@ def load_model_tokenizer_config(
         padding_side: The side to pad the tokenizer on.
         attn_type: The attention implementation to use.
         suffix: A suffix to append to the model name.
+        cache_dir: Directory for downloaded weights. If None, Hugging Face's own default is used.
 
     Returns:
         A tuple containing the NNsight-wrapped model, the chat tokenizer, and the model config.
@@ -64,9 +66,9 @@ def load_model_tokenizer_config(
     if device is None:
         device = get_default_device()
 
-    config = AutoConfig.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir)
     tokenizer = AutoTokenizer.from_pretrained(
-        model_name, use_fast=True, padding_side=padding_side
+        model_name, use_fast=True, padding_side=padding_side, cache_dir=cache_dir
     )
     tokenizer = ChatTemplateTokenizer(
         tokenizer, suffix=suffix, system_prompt=system_prompt
@@ -88,7 +90,7 @@ def load_model_tokenizer_config(
 
     # Set dtype at load time; a dispatched (device_map="auto") model can't be moved with .to()
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, config=config, dtype=dtype, device_map="auto"
+        model_name, config=config, dtype=dtype, device_map="auto", cache_dir=cache_dir
     )
     model = model.eval()
 

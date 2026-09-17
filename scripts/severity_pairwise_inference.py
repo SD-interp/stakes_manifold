@@ -15,8 +15,8 @@ def project_caches(config, records, paths, bundle=None):
         config, records, paths, row_fields=_row_fields, csv_columns=CSV_COLUMNS, bundle=bundle)
 
 
-def run(config, force=False):
+def run(config, force=False, model=None, tokenizer=None):
     return inference_projection.run(
         config, build_records=build_prompt_records, dataset_name='severity_pairwise',
         cache_namespace='severity_pairwise_inference', csv_name='severity_pairwise_arc_lengths.csv',
-        row_fields=_row_fields, csv_columns=CSV_COLUMNS, force=force)
+        row_fields=_row_fields, csv_columns=CSV_COLUMNS, force=force, model=model, tokenizer=tokenizer)

@@ -55,10 +55,19 @@ class RunConfig:
     artifact_root: Path = ROOT / 'artifacts'
     device: str | None = None
     naming_convention: str = 'llama'
+    # Where Hugging Face stores downloaded weights. None keeps the Hugging Face
+    # default (HF_HOME/hub, or HF_HUB_CACHE when set). A path is expanded and made
+    # absolute so every download, load and cache scan agrees on one directory.
+    hf_cache_dir: str | Path | None = None
 
     def __post_init__(self):
         layer_index(self.layer_component)
         naming_convention_spec(self.naming_convention)
+        if self.hf_cache_dir is not None:
+            if not isinstance(self.hf_cache_dir, (str, Path)) or not str(self.hf_cache_dir).strip():
+                raise ValueError('hf_cache_dir must be None or a nonempty path.')
+            object.__setattr__(self, 'hf_cache_dir',
+                               Path(self.hf_cache_dir).expanduser().resolve())
         if type(self.batch_size) is not int or self.batch_size < 1:
             raise ValueError('batch_size must be a positive integer.')
         unknown = set(self.stakes_merges) | set(self.stakes_merges.values())
@@ -101,5 +110,7 @@ class RunConfig:
         return sorted(self.activations_dir.glob(f'{corpus}--*.pt'))
 
     def describe(self):
+        cache = self.hf_cache_dir or 'Hugging Face default'
         return (f'{self.model_name}, {self.layer_component}, position {self.position}, '
-                f'batch size {self.batch_size} -> {self.run_dir}')
+                f'batch size {self.batch_size} -> {self.run_dir} '
+                f'(weights cache: {cache})')

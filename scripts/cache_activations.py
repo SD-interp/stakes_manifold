@@ -46,7 +46,12 @@ def activation_dtype(device):
 
 
 def load_model(config):
-    """Load the model and chat tokenizer with the settings every cache records."""
+    """Load the model and chat tokenizer with the settings every cache records.
+
+    Weights are downloaded to and read from `config.hf_cache_dir`; None means the
+    Hugging Face default location.
+    """
+    cache_dir = None if config.hf_cache_dir is None else str(config.hf_cache_dir)
     if config.naming_convention == "gemma4":
         import torch
         from transformers import AutoModelForMultimodalLM, AutoTokenizer
@@ -54,7 +59,7 @@ def load_model(config):
 
         device = resolve_device(config)
         tokenizer = AutoTokenizer.from_pretrained(
-            config.model_name, use_fast=True, padding_side="left"
+            config.model_name, use_fast=True, padding_side="left", cache_dir=cache_dir
         )
         tokenizer = ChatTemplateTokenizer(tokenizer, system_prompt="")
         model = AutoModelForMultimodalLM.from_pretrained(
@@ -62,6 +67,7 @@ def load_model(config):
             dtype=getattr(torch, activation_dtype(device)),
             device_map="auto",
             attn_implementation="sdpa",
+            cache_dir=cache_dir,
         ).eval()
         return model, tokenizer
 
@@ -75,6 +81,7 @@ def load_model(config):
         padding_side="left",
         attn_type="sdpa",
         system_prompt="",
+        cache_dir=cache_dir,
     )
     return model, tokenizer
 
