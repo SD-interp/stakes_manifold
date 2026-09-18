@@ -28,6 +28,10 @@ RUN_CONFIG_FILE = 'run_config.json'
 # they are deliberately absent: each half sets its own.
 SHARED_SETTINGS = ('model_name', 'naming_convention', 'layer_component', 'position',
                    'batch_size', 'stakes_merges')
+# The subset that determines what the caches contain. Batch size only changes how rows
+# are grouped for the forward pass, and stakes merges are applied when caches are read,
+# so neither enters a cache fingerprint and changing them never invalidates a cache.
+CACHE_SETTINGS = ('model_name', 'naming_convention', 'layer_component', 'position')
 
 # Extend this registry with the dotted layer-count config attribute and the
 # exact decoder-block path from dict(model.named_modules()); {layer} is zero-based.
@@ -134,15 +138,16 @@ class RunConfig:
 def save_run_config(config, force=False):
     """Record, beside the artifacts, the settings the analysis half must reuse.
 
-    A manifest that disagrees with `config` means the directory already holds caches
-    made with other settings, which the analysis half would silently mix. That raises
-    unless `force`, the same flag that rebuilds those caches.
+    A manifest that disagrees with `config` on a cache-defining setting means the
+    directory already holds caches made with other settings, which the analysis half
+    would silently mix. That raises unless `force`, the same flag that rebuilds those
+    caches. The other shared settings are simply updated to the current values.
     """
     settings = config.shared_settings()
     path = config.run_dir / RUN_CONFIG_FILE
     if path.is_file() and not force:
         recorded = json.loads(path.read_text(encoding='utf-8'))
-        differing = sorted(name for name in set(recorded) | set(settings)
+        differing = sorted(name for name in CACHE_SETTINGS
                            if recorded.get(name) != settings.get(name))
         if differing:
             raise ValueError(f'{path} records different settings for {differing}; '

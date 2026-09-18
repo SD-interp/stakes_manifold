@@ -180,6 +180,13 @@ class SeverityTests(unittest.TestCase):
                          'cuda')
 
         pipeline_config.save_run_config(config)  # identical settings: no complaint
+        # Batch size and stakes merges leave the caches valid, so they are just updated.
+        regrouped = RunConfig(artifact_root=Path(self.temp.name), device='cpu', batch_size=4,
+                              layer_component='layer_out/9')
+        pipeline_config.save_run_config(regrouped)
+        restored = pipeline_config.load_run_config(config.run_dir)
+        self.assertEqual(restored.batch_size, 4)
+        self.assertEqual(restored.stakes_merges, pipeline_config.DEFAULT_STAKES_MERGES)
         moved = RunConfig(artifact_root=Path(self.temp.name), device='cpu', batch_size=2,
                           layer_component='layer_out/11')
         with self.assertRaisesRegex(ValueError, 'records different settings'):
