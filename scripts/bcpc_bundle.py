@@ -9,6 +9,8 @@ One folder per model, `RunConfig.bcpc_dir` (`artifacts/<model>/bcpc/`):
                   summaries, the fitted cache files, code and file checksums
 - `rows.parquet`  every horizon-free row scored by the full fit alone: BCPC scores,
                   `bcpc_arc_length`, `refined_stakes`, `refined_residual`, and `cv_fold`
+- `excluded_rows.parquet`  the same columns, except `cv_fold`, for the rows of
+                  `cv.EXCLUDED_TEMPLATES`, which the fit never saw
 - `plot_data/`    what the out-of-fold plots draw: `scores.parquet` (BCPC1-3 of the full
                   fit and of every fold's held-out rows), `anchors.parquet`,
                   `retention.parquet` and `refinement.parquet` (per-row held-out values)
@@ -97,12 +99,17 @@ def _cross_validation_summary(result):
 def save_bcpc_bundle(result, directory):
     """Write the full fit, its row scores and the plot data of one model's cross-validation.
 
-    The saved model is reloaded and must reproduce every row's arc length before this returns.
+    The rows of `cv.EXCLUDED_TEMPLATES` are loaded from the model's caches and scored by the
+    full fit, which never saw them. The saved model is reloaded and must reproduce every
+    row's arc length before this returns.
     """
     full, curve, provenance = result.full, result.full.curve, result.provenance
     if full is None or provenance is None:
         raise ValueError('The result lacks its full fit or provenance; rerun cv.cross_validate.')
     _check_sources(provenance['sources'])
+    excluded = cv.load_model(provenance['run_dir'], excluded=True)
+    excluded_rows, excluded_sources = cv.score_rows(full, excluded), excluded.sources
+    del excluded
     directory = Path(directory)
     (directory / 'plot_data').mkdir(parents=True, exist_ok=True)
 
@@ -120,13 +127,16 @@ def save_bcpc_bundle(result, directory):
     _write(directory / 'model.npz', write_npz)
     _write(directory / 'rows.parquet',
            lambda path: result.full_rows.to_parquet(path, engine='pyarrow', index=False))
+    _write(directory / 'excluded_rows.parquet',
+           lambda path: excluded_rows.to_parquet(path, engine='pyarrow', index=False))
     plot_frames = dict(scores=result.scores, anchors=result.anchors, retention=result.retention,
                        refinement=result.refinement)
     for name, frame in plot_frames.items():
         _write(directory / 'plot_data' / f'{name}.parquet',
                lambda path, frame=frame: frame.to_parquet(path, engine='pyarrow', index=False))
 
-    files = ['model.npz', 'rows.parquet', *(f'plot_data/{name}.parquet' for name in PLOT_DATA)]
+    files = ['model.npz', 'rows.parquet', 'excluded_rows.parquet',
+             *(f'plot_data/{name}.parquet' for name in PLOT_DATA)]
     metadata = dict(
         schema_version=SCHEMA_VERSION,
         created_utc=datetime.now(timezone.utc).isoformat(timespec='seconds'),
@@ -154,6 +164,8 @@ def save_bcpc_bundle(result, directory):
         cross_validation=_cross_validation_summary(result),
         sources=[{key: s[key] for key in ('source_file', 'size', 'mtime_ns', 'rows')}
                  for s in provenance['sources']],
+        excluded_sources=[{key: s[key] for key in ('source_file', 'size', 'mtime_ns', 'rows')}
+                          for s in excluded_sources],
         files={name: _sha256(directory / name) for name in files},
         code=dict(**_git_state(), sha256={name: _sha256(ROOT / name) for name in CODE_FILES}),
         runtime_versions=_runtime_versions())
@@ -161,12 +173,14 @@ def save_bcpc_bundle(result, directory):
            lambda path: path.write_text(json.dumps(metadata, indent=2), encoding='utf-8'))
 
     fit, _ = load_bcpc_bundle(directory)
-    saved = pd.read_parquet(directory / 'rows.parquet')
-    arc = fit.curve.batch_arc_length(saved[fit.curve.score_columns].to_numpy())
-    if not (np.allclose(arc, saved['bcpc_arc_length'], rtol=0, atol=1e-9)
-            and np.allclose(fit.refined(arc), saved['refined_stakes'], rtol=0, atol=1e-9)):
-        raise RuntimeError(f'The reloaded model does not reproduce the saved arc lengths in {directory}.')
-    _check_sources(provenance['sources'])
+    for name in ('rows.parquet', 'excluded_rows.parquet'):
+        saved = pd.read_parquet(directory / name)
+        arc = fit.curve.batch_arc_length(saved[fit.curve.score_columns].to_numpy())
+        if not (np.allclose(arc, saved['bcpc_arc_length'], rtol=0, atol=1e-9)
+                and np.allclose(fit.refined(arc), saved['refined_stakes'], rtol=0, atol=1e-9)):
+            raise RuntimeError(f'The reloaded model does not reproduce the saved arc lengths in '
+                               f'{directory / name}.')
+    _check_sources(provenance['sources'] + excluded_sources)
     return directory
 
 

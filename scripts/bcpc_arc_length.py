@@ -1,16 +1,21 @@
-"""Between-class PCA of merged stakes classes and arc length along its centroid spline.
+"""Between-class PCA of merged stakes classes and arc length along its stakes spline.
 
-BCPC rows carry equal total weight per source file. Median class centers, the
-BCPC1-3 anchor selection, and the full BCPC1-7 penalized cubic spline follow the
-original seven-component target; `bcpc_arc_length` starts at the end nearest very_low.
+BCPC rows carry equal total weight per source file. The cubic spline is fitted by
+weighted least squares to every fitting row's BCPC scores, with the two BCPC1-3 end
+anchors pinned exactly as its start and end points. The polyline through the negative
+anchor, the class centres in BCPC1 order and the positive anchor seeds each row's curve
+parameter and places the knots and the penalized end segments; the fit then alternates
+between projecting every row onto the curve and refitting it. `bcpc_arc_length` starts
+at the end nearest very_low.
 """
 from dataclasses import dataclass
+import warnings
 
 import numpy as np
 import pandas as pd
 from numpy.polynomial import polynomial as poly
 from scipy.integrate import quad
-from scipy.interpolate import BSpline, splev
+from scipy.interpolate import BSpline
 from scipy.linalg import eigh
 
 
@@ -18,17 +23,20 @@ from scipy.linalg import eigh
 class BcpcSettings:
     n_components: int = 7
     centroid_method: str = 'median'
-    anchor_weight: float = 1.0
     internal_knots: int = 2
     end_curvature_penalty: float = 0.0002
     degree: int = 3
     curve_points: int = 500
+    max_iterations: int = 100       # project-and-refit rounds of the row fit
+    tolerance: float = 1e-8         # stop when the objective falls by less than this share
 
     def __post_init__(self):
         if self.centroid_method not in ('mean', 'median'):
             raise ValueError('centroid_method must be "mean" or "median".')
-        if not np.isfinite(self.anchor_weight) or self.anchor_weight <= 0:
-            raise ValueError('anchor_weight must be finite and positive.')
+        if not isinstance(self.max_iterations, int) or self.max_iterations < 1:
+            raise ValueError('max_iterations must be a positive integer.')
+        if not np.isfinite(self.tolerance) or self.tolerance < 0:
+            raise ValueError('tolerance must be finite and nonnegative.')
         if not np.isfinite(self.end_curvature_penalty) or self.end_curvature_penalty < 0:
             raise ValueError('end_curvature_penalty must be finite and nonnegative.')
         if self.degree != 3:
@@ -103,8 +111,62 @@ def fit_between_class_pca(X, weights, labels, n_components):
     return projection, class_index, scores
 
 
+def _parameter_grid(curve, grid_points):
+    """A dense parameter grid over the curve's domain that includes every knot."""
+    edges = np.unique(curve.t[curve.k: -curve.k])
+    return np.union1d(np.linspace(edges[0], edges[-1], grid_points), edges)
+
+
+def closest_parameters(curve, points, grid_points=4097, newton_steps=8, chunk_rows=2048):
+    """Parameter of each point's closest point on a B-spline curve.
+
+    Each point's nearest node on a dense parameter grid seeds Newton iterations on
+    (C(u) - x) . C'(u) = 0, kept within one grid spacing of that node; the node is kept
+    if refinement does not improve on it.
+    """
+    first, second = curve.derivative(), curve.derivative(2)
+    grid = _parameter_grid(curve, grid_points)
+    grid_points_xyz = curve(grid)
+    grid_norms = np.sum(grid_points_xyz ** 2, axis=1)
+
+    points = np.asarray(points, dtype=np.float64)
+    parameters = np.empty(len(points))
+    for start in range(0, len(points), chunk_rows):
+        x = points[start:start + chunk_rows]
+        nearest = np.argmin(grid_norms[None, :] - 2 * x @ grid_points_xyz.T, axis=1)
+        lower = grid[np.maximum(nearest - 1, 0)]
+        upper = grid[np.minimum(nearest + 1, len(grid) - 1)]
+        u = grid[nearest]
+        for _ in range(newton_steps):
+            residual = curve(u) - x
+            d1, d2 = first(u), second(u)
+            gradient = np.sum(residual * d1, axis=1)
+            curvature = np.sum(d1 * d1, axis=1) + np.sum(residual * d2, axis=1)
+            step = np.where(curvature > 0, gradient / np.where(curvature > 0, curvature, 1.0), 0.0)
+            u = np.clip(u - step, lower, upper)
+        refined_distance = np.sum((curve(u) - x) ** 2, axis=1)
+        node_distance = np.sum((grid_points_xyz[nearest] - x) ** 2, axis=1)
+        parameters[start:start + len(x)] = np.where(refined_distance <= node_distance, u, grid[nearest])
+    return parameters
+
+
+def _polyline_parameters(vertices, vertex_parameter, points):
+    """Parameter of each point's closest point on a polyline, interpolated along its segments."""
+    best_parameter = np.zeros(len(points))
+    best_distance = np.full(len(points), np.inf)
+    for i in range(len(vertices) - 1):
+        start, step = vertices[i], vertices[i + 1] - vertices[i]
+        t = np.clip((points - start) @ step / (step @ step), 0.0, 1.0)
+        distance = np.sum((points - start - t[:, None] * step) ** 2, axis=1)
+        closer = distance < best_distance
+        best_distance[closer] = distance[closer]
+        best_parameter[closer] = (vertex_parameter[i]
+                                  + t[closer] * (vertex_parameter[i + 1] - vertex_parameter[i]))
+    return best_parameter
+
+
 class BcpcArcLength:
-    """Fit BCPC scores and the oriented closest-point arc length of their centroid spline."""
+    """Fit BCPC scores and the oriented closest-point arc length of their stakes spline."""
 
     def __init__(self, settings=None):
         self.settings = settings or BcpcSettings()
@@ -121,12 +183,13 @@ class BcpcArcLength:
         """Fit centers, spline and orientation to already computed BCPC scores.
 
         `projection` is a `fit_between_class_pca` dictionary whose `classes` are indexed by
-        `class_index`; `scores` are the fitting rows' coordinates in its components.
+        `class_index`; `scores` are the fitting rows' coordinates in its components, and the
+        spline is fitted to all of them with `weights`.
         """
         self.projection = projection
         self.score_columns = [f'BCPC{i + 1}' for i in range(scores.shape[1])]
         self._fit_centers(scores, weights, class_index)
-        self._fit_spline()
+        self._fit_spline(scores, weights)
         self._orient()
         self.spline_curve['bcpc_arc_length'] = [self.arc_length_at(u)
                                                 for u in self.spline_curve['parameter']]
@@ -197,7 +260,16 @@ class BcpcArcLength:
         ).T
         self.anchors.index.name = 'anchor'
 
-    def _fit_spline(self):
+    def _fit_spline(self, scores, weights):
+        """Weighted least-squares cubic spline through every row, with the anchors pinned.
+
+        The first and last B-spline coefficients are the negative and positive anchors, so
+        the curve starts and ends exactly on them; the other coefficients are free. Each row
+        starts at its closest point on the anchor-centre polyline, parameterized by chord
+        length. The fit then alternates a least-squares refit at fixed row parameters with a
+        closest-point reprojection of every row. Both steps lower the weighted squared
+        distance plus end penalty, so it stops once that falls by less than `tolerance`.
+        """
         s = self.settings
         score_columns = self.score_columns
         spline_points = pd.concat([
@@ -206,42 +278,36 @@ class BcpcArcLength:
             self.anchors.loc[['positive_anchor']],
         ])
         control_scores = spline_points[score_columns].to_numpy()
-        fit_weights = np.ones(len(spline_points))
-        fit_weights[[0, -1]] = s.anchor_weight
 
-        max_internal_knots = len(control_scores) - s.degree - 1
         if (not isinstance(s.internal_knots, int) or isinstance(s.internal_knots, bool)
-                or not 0 <= s.internal_knots <= max_internal_knots):
-            raise ValueError(f'internal_knots must be an integer from 0 to {max_internal_knots}.')
+                or s.internal_knots < 0):
+            raise ValueError('internal_knots must be a nonnegative integer.')
 
         chord_lengths = np.linalg.norm(np.diff(control_scores, axis=0), axis=1)
         if np.any(chord_lengths == 0):
             raise ValueError('Consecutive spline points coincide; chord-length parameters must be distinct.')
-        parameter = np.r_[0.0, np.cumsum(chord_lengths)]
-        parameter /= parameter[-1]
+        polyline_parameter = np.r_[0.0, np.cumsum(chord_lengths)]
+        polyline_parameter /= polyline_parameter[-1]
 
         internal_knots = np.quantile(
-            parameter, np.linspace(0.0, 1.0, s.internal_knots + 2)[1:-1]
+            polyline_parameter, np.linspace(0.0, 1.0, s.internal_knots + 2)[1:-1]
         )
         knot_vector = np.r_[
-            np.repeat(parameter[0], s.degree + 1),
+            np.repeat(0.0, s.degree + 1),
             internal_knots,
-            np.repeat(parameter[-1], s.degree + 1),
+            np.repeat(1.0, s.degree + 1),
         ]
 
         # Identity coefficients expose every B-spline basis function as one column.
         n_basis = len(knot_vector) - s.degree - 1
         basis = BSpline(knot_vector, np.eye(n_basis), s.degree)
-        sqrt_weights = np.sqrt(fit_weights)[:, None]
-        design = sqrt_weights * basis(parameter)
-        target = sqrt_weights * control_scores
-
+        penalty_design = np.zeros((0, n_basis))
         if s.end_curvature_penalty > 0:
             second_derivative = basis.derivative(2)
             penalty_blocks = []
             for left, right in (
-                (parameter[0], parameter[1]),
-                (parameter[-2], parameter[-1]),
+                (polyline_parameter[0], polyline_parameter[1]),
+                (polyline_parameter[-2], polyline_parameter[-1]),
             ):
                 # Split at every internal knot so the second derivative is linear
                 # within each integration span. Its squared norm is quadratic.
@@ -255,28 +321,53 @@ class BcpcArcLength:
                         np.sqrt(s.end_curvature_penalty * half_width) * second_derivative(nodes)
                     )
             penalty_design = np.vstack(penalty_blocks)
-            design = np.vstack([design, penalty_design])
-            target = np.vstack([target, np.zeros((len(penalty_design), len(score_columns)))])
 
-        coefficients, _, rank, _ = np.linalg.lstsq(design, target, rcond=None)
-        if rank < n_basis:
-            raise ValueError('Spline fit is rank deficient; reduce internal_knots.')
-        spline_tck = (knot_vector, coefficients.T, s.degree)
+        # Clamped knots put the curve's ends exactly on the first and last coefficients.
+        ends = control_scores[[0, -1]]
+        free = slice(1, n_basis - 1)
+        penalty_target = -penalty_design[:, [0, -1]] @ ends
+        row_weights = np.asarray(weights, dtype=np.float64)
+        row_weights = row_weights / row_weights.sum()
+        sqrt_weights = np.sqrt(row_weights)[:, None]
+
+        parameter = _polyline_parameters(control_scores, polyline_parameter, scores)
+        objective, converged = np.inf, False
+        for iteration in range(1, s.max_iterations + 1):
+            design = basis(parameter)
+            target = scores - design[:, [0, -1]] @ ends
+            solution, _, rank, _ = np.linalg.lstsq(
+                np.vstack([sqrt_weights * design[:, free], penalty_design[:, free]]),
+                np.vstack([sqrt_weights * target, penalty_target]), rcond=None)
+            if rank < n_basis - 2:
+                raise ValueError('Spline fit is rank deficient; reduce internal_knots.')
+            coefficients = np.vstack([ends[:1], solution, ends[1:]])
+            curve = BSpline(knot_vector, coefficients, s.degree)
+
+            parameter = closest_parameters(curve, scores)
+            distance = np.sum((curve(parameter) - scores) ** 2, axis=1)
+            penalty = np.sum((penalty_design @ coefficients) ** 2)
+            previous, objective = objective, float(row_weights @ distance + penalty)
+            if previous - objective <= s.tolerance * objective:
+                converged = True
+                break
+        if not converged:
+            warnings.warn(f'The spline fit did not converge in {s.max_iterations} iterations.')
+        self.fit_iterations = iteration
+        self.objective = objective
+        self.weighted_residual_sum = float(row_weights @ distance)
+        self.curve = curve
+
         curve_parameter = np.linspace(0.0, 1.0, s.curve_points)
-        self.spline_curve = pd.DataFrame(
-            np.asarray(splev(curve_parameter, spline_tck)).T,
-            columns=score_columns,
-        )
+        self.spline_curve = pd.DataFrame(curve(curve_parameter), columns=score_columns)
         self.spline_curve.insert(0, 'parameter', curve_parameter)
 
-        fitted_scores = np.asarray(splev(parameter, spline_tck)).T
-        spline_points['parameter'] = parameter
-        spline_points['fit_weight'] = fit_weights
-        spline_points['residual_distance'] = np.linalg.norm(control_scores - fitted_scores, axis=1)
-        self.weighted_residual_sum = float(
-            np.sum(fit_weights * spline_points['residual_distance'].to_numpy() ** 2))
+        # The anchors and class centres now only seed the fit; report where they fall on it.
+        control_parameter = closest_parameters(curve, control_scores)
+        spline_points['seed_parameter'] = polyline_parameter
+        spline_points['parameter'] = control_parameter
+        spline_points['residual_distance'] = np.linalg.norm(
+            control_scores - curve(control_parameter), axis=1)
         self.spline_points = spline_points
-        self.curve = BSpline(spline_tck[0], np.asarray(spline_tck[1]).T, spline_tck[2])
 
     def _orient(self):
         if 'very_low' not in self.centroids.index:
@@ -357,9 +448,8 @@ class BcpcArcLength:
         a cumulative Gauss-Legendre table over the grid (knots included, so the speed is
         smooth on every interval) plus the same quadrature from the node to u.
         """
-        curve, first, second = self.curve, self._curve_derivative, self._curve_derivative.derivative()
-        low, high = self._span_edges[0], self._span_edges[-1]
-        grid = np.union1d(np.linspace(low, high, grid_points), self._span_edges)
+        first = self._curve_derivative
+        grid = _parameter_grid(self.curve, grid_points)
         nodes, gauss_weights = np.polynomial.legendre.leggauss(8)
 
         def length_from(start, stop):
@@ -370,34 +460,15 @@ class BcpcArcLength:
             return half * (speed @ gauss_weights)
 
         cumulative = np.r_[0.0, np.cumsum(length_from(grid[:-1], grid[1:]))]
-        grid_points_xyz = curve(grid)
-        grid_norms = np.sum(grid_points_xyz ** 2, axis=1)
-
-        points = np.asarray(points, dtype=np.float64)
-        lengths = np.empty(len(points))
-        for start in range(0, len(points), chunk_rows):
-            x = points[start:start + chunk_rows]
-            nearest = np.argmin(grid_norms[None, :] - 2 * x @ grid_points_xyz.T, axis=1)
-            lower = grid[np.maximum(nearest - 1, 0)]
-            upper = grid[np.minimum(nearest + 1, len(grid) - 1)]
-            u = grid[nearest]
-            for _ in range(newton_steps):
-                residual = curve(u) - x
-                d1, d2 = first(u), second(u)
-                gradient = np.sum(residual * d1, axis=1)
-                curvature = np.sum(d1 * d1, axis=1) + np.sum(residual * d2, axis=1)
-                step = np.where(curvature > 0, gradient / np.where(curvature > 0, curvature, 1.0), 0.0)
-                u = np.clip(u - step, lower, upper)
-            # Keep the grid node if refinement did not improve on it.
-            refined_distance = np.sum((curve(u) - x) ** 2, axis=1)
-            node_distance = np.sum((grid_points_xyz[nearest] - x) ** 2, axis=1)
-            u = np.where(refined_distance <= node_distance, u, grid[nearest])
-
+        parameters = closest_parameters(self.curve, points, grid_points, newton_steps, chunk_rows)
+        lengths = np.empty(len(parameters))
+        for start in range(0, len(parameters), chunk_rows):
+            u = parameters[start:start + chunk_rows]
             interval = np.clip(np.searchsorted(grid, u, side='right') - 1, 0, len(grid) - 2)
             length = cumulative[interval] + length_from(grid[interval], u)
             if self.reverse_arc_length:
                 length = self.total_arc_length - length
-            lengths[start:start + len(x)] = np.clip(length, 0.0, self.total_arc_length)
+            lengths[start:start + len(u)] = np.clip(length, 0.0, self.total_arc_length)
         return lengths
 
     def add_arc_length_columns(self, frame, point_coordinates):

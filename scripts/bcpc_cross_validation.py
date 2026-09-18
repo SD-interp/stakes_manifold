@@ -25,7 +25,8 @@ The templates in `EXCLUDED_TEMPLATES` never enter a fit; see the comment there.
 
 Every average across templates gives each template equal total weight, split equally
 among its rows, as the old surface pipeline did. This covers the class means, the
-spline's class medians, the held-out geometry and the task averages.
+spline's class medians and its least-squares fit to the rows, the held-out geometry and
+the task averages.
 
 Activations are held in float64, about 0.7 GB for a 5,376-wide model. The between-class
 scatter is M^T M with M the K x d matrix of mass-weighted centred class means, so its
@@ -105,8 +106,11 @@ class ModelResult:
     settings: dict = None       # folds, seed and components of this cross-validation
 
 
-def load_model(run_dir):
-    """Every horizon-free row of one model with merged stakes, activations in float64."""
+def load_model(run_dir, excluded=False):
+    """Every horizon-free row of one model with merged stakes, activations in float64.
+
+    With `excluded=True`, only the rows of `EXCLUDED_TEMPLATES` instead.
+    """
     config = load_run_config(run_dir)
     # STAKES_MERGES replaces the run config's merges, whatever the caching pass recorded.
     inventory = CacheInventory(config.activations_dir, config.model_name, config.layer_component,
@@ -115,7 +119,7 @@ def load_model(run_dir):
     missing = set(EXCLUDED_TEMPLATES) - set(names.values())
     if missing:
         raise ValueError(f'Excluded templates not found in {config.activations_dir}: {sorted(missing)}')
-    fit_files = [rel for rel in inventory.fit_files if names[rel] not in EXCLUDED_TEMPLATES]
+    fit_files = [rel for rel in inventory.fit_files if (names[rel] in EXCLUDED_TEMPLATES) == excluded]
     frames = [inventory.entries[rel]['frame'] for rel in fit_files]
     rows = pd.concat(frames, ignore_index=True)
     X = np.empty((len(rows), inventory.feature_count), dtype=np.float64)
@@ -280,6 +284,18 @@ def retained_geometry(data, held_out, half, fit):
     return bcpc, dom, total
 
 
+def score_rows(fit, data):
+    """Every row of `data` scored by `fit` alone: BCPC scores, arc length, refined stakes
+    and the residual from the row's labelled class centre."""
+    scores = project(data, np.arange(len(data.rows)), fit.bcpc)
+    arc = arc_length(fit.curve, scores)
+    refined = fit.refined(arc)
+    return data.rows[ROW_COLUMNS].assign(
+        **{column: scores[:, j] for j, column in enumerate(fit.curve.score_columns)},
+        bcpc_arc_length=arc, refined_stakes=refined,
+        refined_residual=refined - fit.class_refined[data.rows['class_index'].to_numpy()])
+
+
 def cross_validate(data, folds, seed, n_components=None, spline=None):
     """In-sample fit, then every task fold, scoring all rows in every fit.
 
@@ -290,15 +306,9 @@ def cross_validate(data, folds, seed, n_components=None, spline=None):
     everything = np.arange(len(rows))
     label = rows['class_index'].to_numpy()
     full = fit_fold(data, everything, n_components, spline)
-    scores = project(data, everything, full.bcpc)
-    full_arc = arc_length(full.curve, scores)
-    full_refined = full.refined(full_arc)
-    full_rows = rows[ROW_COLUMNS].assign(
-        cv_fold=folds, **{column: scores[:, j] for j, column in enumerate(full.curve.score_columns)},
-        bcpc_arc_length=full_arc, refined_stakes=full_refined,
-        refined_residual=full_refined - full.class_refined[label])
-    frames = [pd.DataFrame(scores[:, :3], columns=['BCPC1', 'BCPC2', 'BCPC3']).assign(
-        refined=full_refined, fit='in_sample', fold=-1, row=everything)]
+    full_rows = score_rows(full, data).assign(cv_fold=folds)
+    frames = [full_rows[['BCPC1', 'BCPC2', 'BCPC3']].assign(
+        refined=full_rows['refined_stakes'].to_numpy(), fit='in_sample', fold=-1, row=everything)]
     anchors = [_anchor_frame(full.curve, 'in_sample', -1)]
     template_half = rows['source_file'].map(
         stratified_folds(rows['source_file'], rows['register'], 2, seed)).to_numpy()

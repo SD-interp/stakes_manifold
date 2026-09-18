@@ -5,8 +5,9 @@ the stakes classes come from the saved BCPC bundle in `artifacts/<model>/bcpc/`
 (`bcpc_bundle.py`). The surface geometry and its weighting are unchanged:
 
 1. every horizon-free row outside `cv.EXCLUDED_TEMPLATES` is joined to `bcpc/rows.parquet`
-   on (source_file, source_row), and the bundle must reproduce the saved arc lengths from
-   the activations
+   on (source_file, source_row), whose saved arc lengths are taken as given. With
+   `SurfaceSettings.include_excluded_templates`, the excluded templates' rows are added,
+   joined to `bcpc/excluded_rows.parquet`: the BCPC never saw them, but the surface fits them
 2. 16 centred, unscaled PLS components against `bcpc_arc_length`
 3. per-template class-mean splines in PLS1-3, in ladder order (`stakes_rank`), and
    PLS1-3 rotated into the splines' best-fit shared plane
@@ -92,6 +93,9 @@ class SurfaceSettings:
     validation_rows: int = 32
     reload_check_rows: int = 256
     seed: int = 42
+    # Also fit the rows of cv.EXCLUDED_TEMPLATES, with the arc lengths the BCPC bundle saved
+    # for them in excluded_rows.parquet (scored by the full fit, which never saw them).
+    include_excluded_templates: bool = False
 
     def __post_init__(self):
         if self.pls_components < 3:
@@ -149,43 +153,57 @@ def _check_bundle_link(config, metadata):
                          'was fitted; refit the surface.')
 
 
-def _load_rows(run_dir, chunk_rows):
-    """Activations of every horizon-free row, joined to the bundle's rows in cache order."""
-    data = cv.load_model(run_dir)
-    config = data.config
-    fit, metadata = bcpc_bundle.load_bcpc_bundle(config.bcpc_dir)
-    for key in ('model_name', 'layer_component', 'position'):
-        if metadata[key] != getattr(config, key):
-            raise ValueError(f'BCPC bundle/config {key} mismatch in {config.bcpc_dir}.')
-    saved = pd.read_parquet(config.bcpc_dir / 'rows.parquet')
+def _join_bundle_rows(data, path):
+    """`data`'s rows joined to the bundle rows saved at `path`, which must cover them exactly."""
+    saved = pd.read_parquet(path)
     keys = ['source_file', 'source_row']
     rows = data.rows[keys].merge(saved, on=keys, how='left', validate='one_to_one', indicator=True)
     if len(saved) != len(rows) or not rows.pop('_merge').eq('both').all():
-        raise ValueError(f'{config.bcpc_dir / "rows.parquet"} does not cover exactly the fitted rows; '
+        raise ValueError(f'{path} does not cover exactly the cached rows; '
                          'rerun notebooks/bcpc_out_of_fold.ipynb.')
     if not rows[STAKES].eq(data.rows[STAKES]).all():
-        raise ValueError('Bundle stakes classes differ from the cache labels.')
+        raise ValueError(f'Stakes classes in {path} differ from the cache labels.')
+    return rows
+
+
+def _load_rows(run_dir, include_excluded=False):
+    """Activations of every horizon-free row, joined to the bundle's rows in cache order.
+
+    The bundle's saved `bcpc_arc_length` is taken as given; the BCPC is not rebuilt or rerun.
+    With `include_excluded`, the rows of `cv.EXCLUDED_TEMPLATES` follow the fitted ones,
+    joined to `excluded_rows.parquet`; `in_bcpc_fit` marks which rows the BCPC was fitted on.
+    """
+    data = cv.load_model(run_dir)
+    config = data.config
+    metadata = json.loads((config.bcpc_dir / 'model.json').read_text(encoding='utf-8'))
+    for key in ('model_name', 'layer_component', 'position'):
+        if metadata[key] != getattr(config, key):
+            raise ValueError(f'BCPC bundle/config {key} mismatch in {config.bcpc_dir}.')
+    rows = _join_bundle_rows(data, config.bcpc_dir / 'rows.parquet').assign(in_bcpc_fit=True)
+    X = data.X
+    if include_excluded:
+        path = config.bcpc_dir / 'excluded_rows.parquet'
+        if not path.is_file():
+            raise ValueError(f'{config.bcpc_dir} has no excluded_rows.parquet; '
+                             'rerun notebooks/bcpc_out_of_fold.ipynb.')
+        excluded = cv.load_model(run_dir, excluded=True)
+        rows = pd.concat([rows, _join_bundle_rows(excluded, path).assign(in_bcpc_fit=False)],
+                         ignore_index=True)
+        del data
+        X = np.concatenate([X, excluded.X])
+        del excluded
     if not rows['stakes_rank'].eq(rows[STAKES].map({c: i + 1 for i, c in enumerate(cv.LEVELS)})).all():
         raise ValueError('Bundle stakes_rank does not follow the ladder order.')
-
-    # The bundle must reproduce its own arc lengths from these activations.
-    arc = np.empty(len(rows))
-    for start in range(0, len(rows), chunk_rows):
-        stop = min(start + chunk_rows, len(rows))
-        arc[start:stop] = bcpc_bundle.score_activations(fit, data.X[start:stop])[TARGET].to_numpy()
-    error = float(np.max(np.abs(arc - rows[TARGET].to_numpy())))
-    if error > 1e-6 * max(1.0, float(np.abs(rows[TARGET]).max())):
-        raise ValueError(f'The BCPC bundle does not reproduce its arc lengths (max error {error:.3g}).')
     rows['horizon_type'] = 'horizon_free'
     rows['pls_fit_weight'] = 1.0 / (rows['source_file'].nunique()
                                     * rows.groupby('source_file')['source_row'].transform('size'))
-    return config, metadata, rows, data.X, error
+    return config, metadata, rows, X
 
 
 def fit_surface(run_dir, settings=None):
     """Fit PLS, the centroid-plane rotation and the slice surface; map every row."""
     s = settings or SurfaceSettings()
-    config, bcpc_metadata, rows, X, bundle_error = _load_rows(run_dir, s.chunk_rows)
+    config, bcpc_metadata, rows, X = _load_rows(run_dir, s.include_excluded_templates)
     n_rows, feature_count = X.shape
     if min(feature_count, n_rows - 1) < s.pls_components:
         raise ValueError(f'Insufficient rows or features for {s.pls_components} PLS components.')
@@ -264,7 +282,6 @@ def fit_surface(run_dir, settings=None):
 
     check_positions = np.sort(rng.choice(n_rows, min(n_rows, s.reload_check_rows), replace=False))
     diagnostics = dict(
-        bundle_arc_length_max_error=bundle_error,
         pls=pd.DataFrame({'component': pls_columns,
                           'score_variance': pls.component_variances,
                           'cumulative_x_variance_share': np.cumsum(pls.x_variance_share),
@@ -325,7 +342,8 @@ def save(result, notebook=None):
         notebook=notebook, module='scripts/bcpc_surface.py',
         model_name=config.model_name, layer_component=config.layer_component, position=config.position,
         feature_count=int(len(pls.x_mean)), rows=int(len(rows)), fitting_rows='horizon_free',
-        excluded_templates=list(cv.EXCLUDED_TEMPLATES),
+        excluded_templates=[] if s.include_excluded_templates else list(cv.EXCLUDED_TEMPLATES),
+        bcpc_excluded_templates=list(cv.EXCLUDED_TEMPLATES),
         target=TARGET, stakes_order=list(cv.LEVELS), stakes_merges=cv.STAKES_MERGES,
         bcpc_bundle=_bundle_link(config), weighting=WEIGHTING,
         settings=asdict(s),
