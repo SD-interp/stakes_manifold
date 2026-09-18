@@ -111,18 +111,26 @@ class BcpcArcLength:
 
     def fit(self, X, weights, rows, stakes_column='stakes'):
         """Fit on aligned rows and return them with BCPC scores and arc-length columns."""
-        s = self.settings
-        self.projection, class_index, scores = fit_between_class_pca(
-            X, weights, rows[stakes_column].to_numpy(), s.n_components)
-        self.score_columns = [f'BCPC{i + 1}' for i in range(scores.shape[1])]
+        projection, class_index, scores = fit_between_class_pca(
+            X, weights, rows[stakes_column].to_numpy(), self.settings.n_components)
+        self.fit_curve(projection, scores, weights, class_index)
         projected_rows = pd.concat([rows, pd.DataFrame(scores, columns=self.score_columns)], axis=1)
+        return self.add_arc_length_columns(projected_rows, scores)
+
+    def fit_curve(self, projection, scores, weights, class_index):
+        """Fit centers, spline and orientation to already computed BCPC scores.
+
+        `projection` is a `fit_between_class_pca` dictionary whose `classes` are indexed by
+        `class_index`; `scores` are the fitting rows' coordinates in its components.
+        """
+        self.projection = projection
+        self.score_columns = [f'BCPC{i + 1}' for i in range(scores.shape[1])]
         self._fit_centers(scores, weights, class_index)
         self._fit_spline()
         self._orient()
-        projected_rows = self.add_arc_length_columns(projected_rows, scores)
         self.spline_curve['bcpc_arc_length'] = [self.arc_length_at(u)
                                                 for u in self.spline_curve['parameter']]
-        return projected_rows
+        return self
 
     def class_table(self):
         return pd.DataFrame({'class': self.projection['classes'],
@@ -317,6 +325,58 @@ class BcpcArcLength:
             candidates = candidates[::-1]  # Exact distance ties prefer smaller arc length.
         squared_distances = np.sum((self.curve(candidates) - point) ** 2, axis=1)
         return float(candidates[np.argmin(squared_distances)])
+
+    def batch_arc_length(self, points, grid_points=4097, newton_steps=8, chunk_rows=2048):
+        """Oriented closest-point arc length of many points at once.
+
+        Agrees with `add_arc_length_columns` to floating-point accuracy: each point's
+        nearest node on a dense parameter grid seeds Newton iterations on
+        (C(u) - x) . C'(u) = 0, kept within one grid spacing of that node. Arc length is
+        a cumulative Gauss-Legendre table over the grid (knots included, so the speed is
+        smooth on every interval) plus the same quadrature from the node to u.
+        """
+        curve, first, second = self.curve, self._curve_derivative, self._curve_derivative.derivative()
+        low, high = self._span_edges[0], self._span_edges[-1]
+        grid = np.union1d(np.linspace(low, high, grid_points), self._span_edges)
+        nodes, gauss_weights = np.polynomial.legendre.leggauss(8)
+
+        def length_from(start, stop):
+            """Arc length from start to stop, elementwise, by 8-point Gauss-Legendre."""
+            half = (stop - start) / 2
+            u = (start + stop)[:, None] / 2 + half[:, None] * nodes[None, :]
+            speed = np.linalg.norm(first(u.ravel()), axis=1).reshape(u.shape)
+            return half * (speed @ gauss_weights)
+
+        cumulative = np.r_[0.0, np.cumsum(length_from(grid[:-1], grid[1:]))]
+        grid_points_xyz = curve(grid)
+        grid_norms = np.sum(grid_points_xyz ** 2, axis=1)
+
+        points = np.asarray(points, dtype=np.float64)
+        lengths = np.empty(len(points))
+        for start in range(0, len(points), chunk_rows):
+            x = points[start:start + chunk_rows]
+            nearest = np.argmin(grid_norms[None, :] - 2 * x @ grid_points_xyz.T, axis=1)
+            lower = grid[np.maximum(nearest - 1, 0)]
+            upper = grid[np.minimum(nearest + 1, len(grid) - 1)]
+            u = grid[nearest]
+            for _ in range(newton_steps):
+                residual = curve(u) - x
+                d1, d2 = first(u), second(u)
+                gradient = np.sum(residual * d1, axis=1)
+                curvature = np.sum(d1 * d1, axis=1) + np.sum(residual * d2, axis=1)
+                step = np.where(curvature > 0, gradient / np.where(curvature > 0, curvature, 1.0), 0.0)
+                u = np.clip(u - step, lower, upper)
+            # Keep the grid node if refinement did not improve on it.
+            refined_distance = np.sum((curve(u) - x) ** 2, axis=1)
+            node_distance = np.sum((grid_points_xyz[nearest] - x) ** 2, axis=1)
+            u = np.where(refined_distance <= node_distance, u, grid[nearest])
+
+            interval = np.clip(np.searchsorted(grid, u, side='right') - 1, 0, len(grid) - 2)
+            length = cumulative[interval] + length_from(grid[interval], u)
+            if self.reverse_arc_length:
+                length = self.total_arc_length - length
+            lengths[start:start + len(x)] = np.clip(length, 0.0, self.total_arc_length)
+        return lengths
 
     def add_arc_length_columns(self, frame, point_coordinates):
         """Apply the already fitted spline to aligned rows; does not modify the fit."""
