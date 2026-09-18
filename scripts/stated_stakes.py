@@ -38,7 +38,7 @@ from .corpora.inference import (context_prompts, rating_phrasings,
                                 severity_length_prompts, severity_magnitude_prompts,
                                 severity_null_prompts, severity_pairwise_prompts,
                                 severity_prompts, severity_verb_prompts,
-                                severity_wording_prompts)
+                                severity_wording_prompts, situated_context_prompts)
 from .corpora.inference.rating_phrasings import (GENERATED_TOKENS, PHRASINGS,
                                                  check_phrasings, parse_rating)
 from .pipeline_config import SEED
@@ -63,6 +63,7 @@ DATASETS = {
     'severity_composition': severity_composition_prompts.build_prompt_records,
     'severity_verb': severity_verb_prompts.build_prompt_records,
     'context': context_prompts.build_prompt_records,
+    'situated_context': situated_context_prompts.build_prompt_records,
 }
 
 

@@ -22,13 +22,15 @@ from scripts import (cache_activations, context_inference, inference_datasets,
                      severity_inference, severity_length_inference,
                      severity_magnitude_inference, severity_null_inference,
                      severity_pairwise_inference, severity_verb_inference,
-                     severity_wording_inference, stated_stakes)
+                     severity_wording_inference, situated_context_inference,
+                     stated_stakes)
 from scripts.corpora.inference import (context_prompts, rating_phrasings,
                             severity_composition_prompts, severity_flipped_prompts,
                             severity_magnitude_prompts,
                             severity_length_prompts,
                             severity_null_prompts, severity_pairwise_prompts,
-                            severity_verb_prompts, severity_wording_prompts)
+                            severity_verb_prompts, severity_wording_prompts,
+                            situated_context_prompts)
 from scripts.cache_inventory import CacheInventory
 from scripts.corpora.inference.severity_prompts import TEMPLATES, build_prompt_records
 from scripts.pipeline_config import RunConfig, NO_TIME_CORPORA
@@ -114,7 +116,7 @@ class SeverityTests(unittest.TestCase):
         # Both halves walk the registry, and every corpus in it can also be rated.
         self.assertEqual({dataset.name for dataset in inference_datasets.DATASETS},
                          set(stated_stakes.DATASETS))
-        self.assertEqual(len(inference_datasets.DATASETS), 10)
+        self.assertEqual(len(inference_datasets.DATASETS), 11)
         self.assertIs(inference_datasets.by_name('severity'), severity_inference.DATASET)
 
     @staticmethod
@@ -361,6 +363,119 @@ class SeverityTests(unittest.TestCase):
         fitting_cache_paths = (list(self.config.activations_dir.rglob('*.pt'))
                                if self.config.activations_dir.exists() else [])
         self.assertTrue(all('context' not in path.name for path in fitting_cache_paths))
+
+    def test_situated_context_dataset_varies_the_situation_not_a_label(self):
+        groups = situated_context_prompts.TASK_GROUPS
+        controls = situated_context_prompts.CONTROL_ORDER
+        ranks = situated_context_prompts.STAKES_RANKS
+        low, high = situated_context_prompts.SETTING_WORD_RANGE
+        records = situated_context_prompts.build_prompt_records()
+        per_task = situated_context_prompts.SETTINGS_PER_TASK + len(controls)
+        self.assertEqual((len(groups), ranks, controls),
+                         (16, (1, 2, 3, 4), ('neutral', 'bare')))
+        self.assertEqual((per_task, len(records)), (6, len(groups) * per_task))
+        self.assertEqual(len({record['text'] for record in records}), len(records))
+        # Every situating phrase is a distinct lowercase constituent in one length
+        # band, so no setting is identified by its wording or its length.
+        phrases = [phrase for group in groups
+                   for _, phrase in group['settings'] + (('neutral', group['neutral']),)]
+        self.assertEqual(len(set(phrases)), len(groups) * per_task - len(groups))
+        for phrase in phrases:
+            self.assertTrue(low <= len(phrase.split()) <= high, phrase)
+            self.assertTrue(phrase[:1].islower() and not phrase.endswith('.'), phrase)
+
+        for group in groups:
+            stem, question = group['stem'], group['question']
+            rows = [record for record in records if record['task'] == group['id']]
+            self.assertEqual([row['task_metadata']['setting'] for row in rows],
+                             [setting for setting, _ in group['settings']] + list(controls))
+            self.assertEqual([row['task_metadata']['stakes_rank'] for row in rows],
+                             list(ranks) + [None, None])
+            for row in rows:
+                metadata, phrase = row['task_metadata'], row['task_metadata']['context_phrase']
+                # The task is held fixed: only the situating phrase moves.
+                self.assertTrue(row['text'].startswith(stem) and row['text'].endswith(question))
+                self.assertEqual(row['template_metadata']['core_request'], question)
+                self.assertEqual(row['template_metadata']['context_axis'],
+                                 group['context_axis'])
+                self.assertEqual(metadata['is_control'], metadata['setting'] in controls)
+                self.assertEqual(metadata['usage'], 'inference_only')
+                self.assertNotIn('stakes', metadata)
+                self.assertNotIn('expected_direction', metadata)
+                for field in ('base_value', 'base_unit', 'unit_variant', 'number_format',
+                              'value', 'value_text', 'unit'):
+                    self.assertNotIn(field, row)
+                if phrase is None:
+                    self.assertEqual(metadata['setting'],
+                                     situated_context_prompts.BARE_SETTING)
+                    self.assertEqual(row['text'], stem + '. ' + question)
+                    continue
+                self.assertEqual(row['text'], stem + ' ' + phrase + '. ' + question)
+                self.assertIn(phrase, [text for _, text in group['settings']]
+                              + [group['neutral']])
+
+        changed = copy.deepcopy(groups)
+        changed[0]['settings'] = changed[0]['settings'][:3]
+        with patch.object(situated_context_prompts, 'TASK_GROUPS', changed):
+            with self.assertRaisesRegex(ValueError, 'ranked settings'):
+                situated_context_prompts.build_prompt_records()
+
+        changed = copy.deepcopy(groups)
+        changed[0]['settings'] = (('cinema_foyer', 'in a cinema'),) + changed[0]['settings'][1:]
+        with patch.object(situated_context_prompts, 'TASK_GROUPS', changed):
+            with self.assertRaisesRegex(ValueError, f'{low}-{high} words'):
+                situated_context_prompts.build_prompt_records()
+
+        # A framing sentence is not a situating phrase; the slot takes a constituent.
+        changed = copy.deepcopy(groups)
+        changed[0]['settings'] = ((
+            'cinema_foyer', 'This is only a video game and nobody is real.'),
+        ) + changed[0]['settings'][1:]
+        with patch.object(situated_context_prompts, 'TASK_GROUPS', changed):
+            with self.assertRaisesRegex(ValueError, 'not a sentence'):
+                situated_context_prompts.build_prompt_records()
+
+        changed = copy.deepcopy(groups)
+        changed[0]['stem'] += '.'
+        with patch.object(situated_context_prompts, 'TASK_GROUPS', changed):
+            with self.assertRaisesRegex(ValueError, 'without punctuation'):
+                situated_context_prompts.build_prompt_records()
+
+        changed = copy.deepcopy(groups)
+        changed[1]['neutral'] = changed[0]['neutral']
+        with patch.object(situated_context_prompts, 'TASK_GROUPS', changed):
+            with self.assertRaisesRegex(ValueError, 'unique and unparameterised'):
+                situated_context_prompts.build_prompt_records()
+
+    def test_situated_context_inference_is_isolated_and_aligned(self):
+        records = situated_context_prompts.build_prompt_records()
+        directory = self.config.run_dir / 'inference' / 'situated_context'
+        with self.mock_model() as (loader, tokenize, model):
+            csv, result, _ = situated_context_inference.run(self.config, model, tokenize)
+            loader.assert_not_called()
+        paths = sorted((directory / 'activations').glob('*.pt'))
+        self.assertEqual(len(paths), len(situated_context_prompts.TASK_GROUPS))
+        self.assertTrue(all(path.name.startswith('situated_context_inference--')
+                            for path in paths))
+        self.assertEqual(csv, directory / 'situated_context_arc_lengths.csv')
+        self.assertEqual(list(pd.read_csv(csv).columns),
+                         situated_context_inference.CSV_COLUMNS)
+        self.assertEqual(result.task.tolist(), [record['task'] for record in records])
+        self.assertEqual(result.setting.tolist(),
+                         [record['task_metadata']['setting'] for record in records])
+        # The two controls carry no rank, so the column arrives as a float with gaps.
+        self.assertEqual([None if pd.isna(rank) else int(rank)
+                          for rank in result.stakes_rank],
+                         [record['task_metadata']['stakes_rank'] for record in records])
+        self.assertEqual(result.context_axis.tolist(),
+                         [record['template_metadata']['context_axis'] for record in records])
+        self.assertEqual(result.prompt.tolist(), [record['text'] for record in records])
+        reordered, _ = situated_context_inference.project_caches(
+            self.config, records, sorted(paths, reverse=True))
+        pd.testing.assert_frame_equal(result, reordered)
+        fitting_cache_paths = (list(self.config.activations_dir.rglob('*.pt'))
+                               if self.config.activations_dir.exists() else [])
+        self.assertTrue(all('situated' not in path.name for path in fitting_cache_paths))
 
     def test_null_dataset_reuses_reference_vocabulary_without_stakes(self):
         families = severity_null_prompts.FAMILIES

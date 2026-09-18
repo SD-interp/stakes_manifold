@@ -145,6 +145,29 @@ Its outputs are isolated under `artifacts/<model name>/inference/context/`, incl
 `task`, `context`, `prompt`, `arc_length_parallel`, and `arc_length_orthogonal`, and the
 activation namespace is `context_inference`.
 
+The situated-context dataset in `scripts/corpora/inference/situated_context_prompts.py`
+takes the complementary approach: nothing is attached to the prompt, and the stakes are
+carried by the task itself. Each of its 16 tasks is one stem sentence with a single slot
+for a situating phrase, plus a fixed closing question, so asking what a person who has
+run out of water should do `in the foyer of a cinema between films` and asking the same
+about `on a desert trail in the middle of summer` are two genuinely different
+predicaments described in the same words. Every task declares the `context_axis` its
+four settings move along -- distance from help, how many people are exposed, what a
+lapse would cost -- so a ladder is never a list of synonyms for "worse", and
+`stakes_rank` runs 1 to 4 within a task rather than on a scale shared between tasks.
+Two controls sit outside each ladder: `bare` drops the slot entirely, and `neutral`
+fills it with a length-matched phrase that situates the task in time without bearing on
+what is at stake. All situating phrases are held to one 6-10 word band, so prompt length
+cannot stand in for the setting. The prompts carry no severity label and no expected
+coordinate ordering (16 tasks x 6 settings = 96 prompts).
+
+Its outputs are isolated under `artifacts/<model name>/inference/situated_context/`,
+including `prompts.json`, `activations/`, and `situated_context_arc_lengths.csv`. The
+CSV columns are `task`, `setting`, `stakes_rank`, `context_axis`, `is_control`, `prompt`,
+`arc_length_parallel`, and `arc_length_orthogonal`; the two controls carry no rank, so
+`stakes_rank` is blank on those rows. The activation namespace is
+`situated_context_inference`.
+
 Every inference dataset shares the frozen projection and export logic in
 `scripts/inference_projection.py` and is listed once in `scripts/inference_datasets.py`, which
 both passes walk; none contributes to fitting or slice coverage, and each reuses only its own

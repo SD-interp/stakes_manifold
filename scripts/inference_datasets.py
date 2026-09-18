@@ -3,13 +3,15 @@
 The caching notebook walks this list on the GPU and the analysis notebook walks the
 same list on the CPU, so a corpus added here is picked up by both without either
 notebook being edited. The order is the order results are reported in: the reference
-severity corpus first, then its controls, then the counterfactual and context sets.
+severity corpus first, then its controls, then the counterfactual sets, then the two
+context sets: the attached framings, and the situations that carry their own stakes.
 """
 from . import (context_inference, severity_composition_inference,
                severity_flipped_inference, severity_inference,
                severity_length_inference, severity_magnitude_inference,
                severity_null_inference, severity_pairwise_inference,
-               severity_verb_inference, severity_wording_inference)
+               severity_verb_inference, severity_wording_inference,
+               situated_context_inference)
 
 DATASETS = (
     severity_inference.DATASET,
@@ -22,6 +24,7 @@ DATASETS = (
     severity_wording_inference.DATASET,
     severity_verb_inference.DATASET,
     context_inference.DATASET,
+    situated_context_inference.DATASET,
 )
 
 BY_NAME = {dataset.name: dataset for dataset in DATASETS}

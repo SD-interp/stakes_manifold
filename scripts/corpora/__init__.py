@@ -6,7 +6,8 @@ on: the task metadata schema (`base_task_set`), the task set built on it
 them (`generate_prompts`). They import one another freely.
 
 `inference/` holds the inference-only evaluation corpora (severity, its flipped,
-pairwise, and wording variants, and the context variations). Each of those is
+pairwise, and wording variants, the attached context framings, and the situated
+contexts whose stakes are carried by the task itself). Each of those is
 self-contained and exposes the same `build_prompt_records` interface, so nothing
 in `training/` is needed to project them onto an already-fitted manifold.
 
