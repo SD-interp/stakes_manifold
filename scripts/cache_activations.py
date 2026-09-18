@@ -45,6 +45,38 @@ def activation_dtype(device):
     return "float32"
 
 
+def load_tokenizer(config):
+    """The chat tokenizer `load_model` pairs with the model, without loading weights.
+
+    Its formatting (empty system prompt, generation prompt, thinking off) is what every
+    cache was built from, so it also serves token counts of cached prompts.
+    """
+    from transformers import AutoTokenizer
+    from utils.mech_interp_toolkit.utils import ChatTemplateTokenizer
+
+    cache_dir = None if config.hf_cache_dir is None else str(config.hf_cache_dir)
+    mistral = config.naming_convention == "mistral3"
+    # Mistral 3 checkpoints ship a pre-tokenizer regex that mis-splits text
+    # unless corrected at load time.
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.model_name, use_fast=True, padding_side="left", cache_dir=cache_dir,
+        **(dict(fix_mistral_regex=True) if mistral else {}),
+    )
+    if mistral:
+        # The chat template ships only in the processor's chat_template.json,
+        # which AutoTokenizer does not read. Without an explicit empty system
+        # message it injects a default system prompt stating today's date.
+        from huggingface_hub import hf_hub_download
+
+        template_path = hf_hub_download(
+            config.model_name, "chat_template.json", cache_dir=cache_dir
+        )
+        tokenizer.chat_template = json.loads(
+            Path(template_path).read_text(encoding="utf-8")
+        )["chat_template"]
+    return ChatTemplateTokenizer(tokenizer, system_prompt="", send_empty_system_prompt=mistral)
+
+
 def load_model(config):
     """Load the model and chat tokenizer with the settings every cache records.
 
@@ -58,32 +90,10 @@ def load_model(config):
     cache_dir = None if config.hf_cache_dir is None else str(config.hf_cache_dir)
     if config.naming_convention in ("gemma4", "mistral3"):
         import torch
-        from transformers import AutoModelForMultimodalLM, AutoTokenizer
-        from utils.mech_interp_toolkit.utils import ChatTemplateTokenizer
+        from transformers import AutoModelForMultimodalLM
 
         device = resolve_device(config)
-        mistral = config.naming_convention == "mistral3"
-        # Mistral 3 checkpoints ship a pre-tokenizer regex that mis-splits text
-        # unless corrected at load time.
-        tokenizer = AutoTokenizer.from_pretrained(
-            config.model_name, use_fast=True, padding_side="left", cache_dir=cache_dir,
-            **(dict(fix_mistral_regex=True) if mistral else {}),
-        )
-        if mistral:
-            # The chat template ships only in the processor's chat_template.json,
-            # which AutoTokenizer does not read. Without an explicit empty system
-            # message it injects a default system prompt stating today's date.
-            from huggingface_hub import hf_hub_download
-
-            template_path = hf_hub_download(
-                config.model_name, "chat_template.json", cache_dir=cache_dir
-            )
-            tokenizer.chat_template = json.loads(
-                Path(template_path).read_text(encoding="utf-8")
-            )["chat_template"]
-        tokenizer = ChatTemplateTokenizer(
-            tokenizer, system_prompt="", send_empty_system_prompt=mistral
-        )
+        tokenizer = load_tokenizer(config)
         model = AutoModelForMultimodalLM.from_pretrained(
             config.model_name,
             dtype=getattr(torch, activation_dtype(device)),

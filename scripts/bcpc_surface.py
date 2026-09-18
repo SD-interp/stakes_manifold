@@ -9,22 +9,25 @@ the stakes classes come from the saved BCPC bundle in `artifacts/<model>/bcpc/`
    `SurfaceSettings.include_excluded_templates`, the excluded templates' rows are added,
    joined to `bcpc/excluded_rows.parquet`: the BCPC never saw them, but the surface fits them
 2. 16 centred, unscaled PLS components against `bcpc_arc_length`
-3. per-template class-mean splines in PLS1-3, in ladder order (`stakes_rank`), and
-   PLS1-3 rotated into the splines' best-fit shared plane
-4. the cubic graph PLS2 = f(PLS1, PLS3), with the origin at the very_low PLS1 centroid
+3. per-template curves: each template's PLS1-3 as a cubic spline of `bcpc_arc_length`,
+   sampled over the arc-length range every template covers, and PLS1-3 rotated into the
+   curves' best-fit shared plane
+4. the cubic graph PLS2 = f(PLS1, PLS3), and a zero line: for each PLS3 height, the PLS1 at
+   which rows reach `refined_stakes` = 1 (`bcpc_arc_length` = the bundle's `arc_zero`)
 5. 5,000 fixed-PLS3 slices, validated on a sample, then every row mapped onto them
 
-`arc_length_parallel` is the signed length along the row's slice from the very_low origin.
+`arc_length_parallel` is the signed length along the row's slice from where the slice meets
+the zero line, so each slice has its own zero.
 `arc_length_orthogonal` is the snapped PLS3 height (a legacy name; it is not a geodesic
 length). The weighting is the old pipeline's: PLS gives every template file equal total
-weight, the centroid-plane rotation and the origin count every template equally, and the
-surface fit counts every row equally. These are in-sample descriptive fits, not held-out
+weight, each template's curve counts its rows equally, the plane rotation and the zero
+line count every template equally, and the surface fit counts every row equally. These are in-sample descriptive fits, not held-out
 evaluations.
 
-Output, beside the BCPC bundle:
+Output, in `artifacts/<model>/pls/` beside the BCPC bundle:
 
-- `bcpc/surface/`   model.npz, model.json, rows.parquet and plots/
-- `bcpc/inference/` one CSV per cached inference corpus, with the surface coordinates and
+- `pls/`            model.npz, model.json, rows.parquet (with each row's `prompt` text) and plots/
+- `pls/inference/`  one CSV per cached inference corpus, with the surface coordinates and
                     the bundle's `bcpc_arc_length` and `refined_stakes`
 """
 from dataclasses import asdict, dataclass, field
@@ -36,7 +39,7 @@ import os
 
 import numpy as np
 import pandas as pd
-from scipy.interpolate import BSpline
+from scipy.interpolate import BSpline, make_lsq_spline
 
 from . import bcpc_bundle
 from . import bcpc_cross_validation as cv
@@ -46,9 +49,9 @@ from .pls_fit import WeightedPls
 from .stakes_height_slices import (
     MAPPING_COLUMNS, SliceConfig, SliceSurface, centroid_plane_rotation, validate_slice_mapping,
 )
-from .stakes_surface_bundle import fit_centroid_spline, spline_arrays
+from .stakes_surface_bundle import spline_arrays
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: template curves on bcpc_arc_length; a zero per slice (slice_origin)
 GEOMETRY_TYPE = 'bcpc_pls2_cubic_height_slices'
 TARGET = 'bcpc_arc_length'
 STAKES = 'stakes'
@@ -63,15 +66,18 @@ CODE_FILES = ('scripts/bcpc_surface.py', 'scripts/stakes_height_slices.py', 'scr
               'scripts/inference_projection.py')
 WEIGHTING = dict(  # the old surface pipeline's
     pls='equal total weight per template file, split equally among its rows',
+    template_curves='equal weight per row within its template',
     rotation='equal weight per template',
     surface='equal weight per row',
-    origin='plain mean over templates of the very_low PLS1 class mean')
+    zero_line='equal total weight per template file, split equally among its rows')
 
 # Plot palette on a light chart surface. Stakes classes are ordered, so they take
 # the blue ordinal ramp (lightest step still >= 2:1 on the surface), never cycled hues.
 STAKES_RAMP = ('#86b6ef', '#6da7ec', '#5598e7', '#3987e5', '#2a78d6',
                '#256abf', '#1c5cab', '#184f95', '#104281', '#0d366b')
 SEQUENTIAL_SCALE = [[0.0, '#cde2fb'], [0.5, '#2a78d6'], [1.0, '#0d366b']]
+# The slices' zero line is red, so it stands apart from the blue rows and the grey/black lines.
+ZERO_LINE_COLOR = '#d62728'
 SURFACE_COLOR = '#fcfcfb'
 INK = '#0b0b0b'
 INK_SECONDARY = '#52514e'
@@ -85,6 +91,9 @@ class SurfaceSettings:
     spline_degree: int = 3
     spline_interior_knots: int = 1
     arc_samples: int = 401
+    # The rotation samples every template's curve between the largest of the templates' low
+    # arc-length quantiles and the smallest of their high ones.
+    curve_range_quantiles: tuple = (0.01, 0.99)
     plane_rotation_ridge: float = 1e-6
     slices: SliceConfig = field(default_factory=lambda: SliceConfig(
         n_slices=5000, arc_relative_tolerance=1e-4, max_arc_nodes=262145))
@@ -100,6 +109,9 @@ class SurfaceSettings:
     def __post_init__(self):
         if self.pls_components < 3:
             raise ValueError('The slice surface needs at least PLS1-3.')
+        low, high = self.curve_range_quantiles
+        if not 0 <= low < high <= 1:
+            raise ValueError('curve_range_quantiles must satisfy 0 <= low < high <= 1.')
 
 
 @dataclass
@@ -110,8 +122,8 @@ class SurfaceFit:
     pls: WeightedPls
     slice_rotation: np.ndarray  # rows are the rotated PLS1-3 axes in unrotated PLS1-3
     pls_rotations: np.ndarray   # raw activations -> rotated PLS scores, (d, components)
-    centroids: pd.DataFrame     # per-template class means in rotated PLS1-3
-    file_splines: dict          # {source_file: BSpline} in rotated PLS1-3
+    centroids: pd.DataFrame     # per-template class means in rotated PLS1-3 (plots only)
+    file_splines: dict          # {source_file: BSpline of bcpc_arc_length} in rotated PLS1-3
     surface: SliceSurface       # fitted graph with its slice cache
     diagnostics: dict
     bcpc_metadata: dict
@@ -131,11 +143,11 @@ def _write(path, writer):
 
 
 def surface_dir(config):
-    return config.bcpc_dir / 'surface'
+    return config.run_dir / 'pls'
 
 
 def inference_dir(config):
-    return config.bcpc_dir / 'inference'
+    return surface_dir(config) / 'inference'
 
 
 def has_bcpc_bundle(run_dir):
@@ -154,13 +166,21 @@ def _check_bundle_link(config, metadata):
 
 
 def _join_bundle_rows(data, path):
-    """`data`'s rows joined to the bundle rows saved at `path`, which must cover them exactly."""
+    """`data`'s rows joined to the bundle rows saved at `path`, which must cover them exactly.
+
+    The prompt text comes from the caches, so a bundle saved before it carried `prompt`
+    still yields it; a bundle that does carry it must agree.
+    """
     saved = pd.read_parquet(path)
     keys = ['source_file', 'source_row']
     rows = data.rows[keys].merge(saved, on=keys, how='left', validate='one_to_one', indicator=True)
     if len(saved) != len(rows) or not rows.pop('_merge').eq('both').all():
         raise ValueError(f'{path} does not cover exactly the cached rows; '
-                         'rerun notebooks/bcpc_out_of_fold.ipynb.')
+                         'rerun notebooks/2_bcpc_out_of_fold.ipynb.')
+    if 'prompt' not in rows:
+        rows.insert(rows.columns.get_loc('task') + 1, 'prompt', data.rows['prompt'].to_numpy())
+    elif not rows['prompt'].eq(data.rows['prompt']).all():
+        raise ValueError(f'Prompt text in {path} differs from the caches.')
     if not rows[STAKES].eq(data.rows[STAKES]).all():
         raise ValueError(f'Stakes classes in {path} differ from the cache labels.')
     return rows
@@ -185,7 +205,7 @@ def _load_rows(run_dir, include_excluded=False):
         path = config.bcpc_dir / 'excluded_rows.parquet'
         if not path.is_file():
             raise ValueError(f'{config.bcpc_dir} has no excluded_rows.parquet; '
-                             'rerun notebooks/bcpc_out_of_fold.ipynb.')
+                             'rerun notebooks/2_bcpc_out_of_fold.ipynb.')
         excluded = cv.load_model(run_dir, excluded=True)
         rows = pd.concat([rows, _join_bundle_rows(excluded, path).assign(in_bcpc_fit=False)],
                          ignore_index=True)
@@ -200,8 +220,32 @@ def _load_rows(run_dir, include_excluded=False):
     return config, metadata, rows, X
 
 
+def fit_arc_length_curve(arc, points, interior_knots=1, degree=3):
+    """Least-squares spline of one template's PLS1-3 row scores on their `bcpc_arc_length`.
+
+    The boundary knots sit at the template's smallest and largest arc length and the interior
+    knots at its arc-length quantiles, so the curve is the template's smoothed mean position
+    as a function of arc length. Tied arc lengths (rows at either end of the BCPC spline) are
+    allowed.
+    """
+    if (isinstance(interior_knots, bool) or not isinstance(interior_knots, int)
+            or interior_knots < 0):
+        raise ValueError('interior_knots must be a nonnegative integer.')
+    arc, points = np.asarray(arc, dtype=np.float64), np.asarray(points, dtype=np.float64)
+    if (arc.ndim != 1 or points.shape != (len(arc), 3)
+            or not (np.isfinite(arc).all() and np.isfinite(points).all())):
+        raise ValueError('Expected finite arc lengths and matching PLS1-3 rows.')
+    order = np.argsort(arc, kind='stable')
+    arc, points = arc[order], points[order]
+    if len(np.unique(arc)) < degree + interior_knots + 2:
+        raise ValueError('Too few distinct arc lengths for a template curve.')
+    interior = np.quantile(arc, np.arange(1, interior_knots + 1) / (interior_knots + 1))
+    knots = np.r_[np.full(degree + 1, arc[0]), interior, np.full(degree + 1, arc[-1])]
+    return make_lsq_spline(arc, points, knots, k=degree)
+
+
 def fit_surface(run_dir, settings=None):
-    """Fit PLS, the centroid-plane rotation and the slice surface; map every row."""
+    """Fit PLS, the template-curve plane rotation and the slice surface; map every row."""
     s = settings or SurfaceSettings()
     config, bcpc_metadata, rows, X = _load_rows(run_dir, s.include_excluded_templates)
     n_rows, feature_count = X.shape
@@ -232,42 +276,54 @@ def fit_surface(run_dir, settings=None):
     if not np.isfinite(unrotated).all():
         raise RuntimeError('Nonfinite PLS scores.')
 
-    # Per-template class-mean splines in ladder order, then the shared-plane rotation.
-    scored = rows[['source_file', 'template', STAKES, 'stakes_rank']].assign(
-        **dict(zip(SURFACE_COLUMNS, unrotated[:, :3].T)))
-    centroids = (scored.groupby(['source_file', 'template', STAKES, 'stakes_rank'], sort=False)
-                 [SURFACE_COLUMNS].mean().reset_index().sort_values(['source_file', 'stakes_rank'],
-                                                                   kind='stable'))
-    files = centroids['source_file'].unique()  # one template order throughout
-    counts = centroids.groupby('source_file', sort=False).size()
-    if not counts.eq(len(cv.LEVELS)).all():
-        raise ValueError(f'Templates missing stakes classes: {counts[counts != len(cv.LEVELS)].to_dict()}')
-    progress = np.linspace(0, len(cv.LEVELS) - 1, s.arc_samples)
-    splines, samples, parameters = {}, [], []
-    for rel in files:
-        points = centroids.loc[centroids['source_file'].eq(rel), SURFACE_COLUMNS].to_numpy()
-        spline, spline_parameters = fit_centroid_spline(points, s.spline_interior_knots, s.spline_degree)
-        splines[rel] = spline
-        parameters.append(spline_parameters)
-        samples.append(spline(np.interp(progress, np.arange(len(cv.LEVELS)), spline_parameters)))
+    # Per-template curves of PLS1-3 on bcpc_arc_length, sampled at matched arc lengths over the
+    # range every template covers; the samples set the shared-plane rotation.
+    arc = rows[TARGET].to_numpy()
+    files = sorted(positions)  # one template order throughout
+    splines = {rel: fit_arc_length_curve(arc[positions[rel]], unrotated[positions[rel], :3],
+                                         s.spline_interior_knots, s.spline_degree) for rel in files}
+    q_low, q_high = s.curve_range_quantiles
+    arc_low = max(float(np.quantile(arc[positions[rel]], q_low)) for rel in files)
+    arc_high = min(float(np.quantile(arc[positions[rel]], q_high)) for rel in files)
+    if not arc_low < arc_high:
+        raise ValueError(f'The templates share no {TARGET} range between quantiles {q_low} and {q_high}.')
+    arc_grid = np.linspace(arc_low, arc_high, s.arc_samples)
     # As in the old pipeline, every template counts equally in the rotation.
-    rotation, rotation_diagnostics = centroid_plane_rotation(samples, ridge_relative=s.plane_rotation_ridge)
-    centroids['spline_parameter'] = np.concatenate(parameters)
-    centroids[SURFACE_COLUMNS] = centroids[SURFACE_COLUMNS].to_numpy() @ rotation.T
+    rotation, rotation_diagnostics = centroid_plane_rotation(
+        [splines[rel](arc_grid) for rel in files], ridge_relative=s.plane_rotation_ridge)
     file_splines = {rel: BSpline(spline.t, spline.c @ rotation.T, spline.k, extrapolate=spline.extrapolate)
                     for rel, spline in splines.items()}
-    centroids['spline_residual'] = np.concatenate([
-        np.linalg.norm(file_splines[rel](group['spline_parameter'].to_numpy())
-                       - group[SURFACE_COLUMNS].to_numpy(), axis=1)
-        for rel, group in centroids.groupby('source_file', sort=False)])
     pls_rotations = pls.base_rotations.copy()
     pls_rotations[:, :3] = pls.base_rotations[:, :3] @ rotation.T
     rows[pls_columns] = unrotated
     rows[SURFACE_COLUMNS] = unrotated[:, :3] @ rotation.T
+    rotated = rows[SURFACE_COLUMNS].to_numpy()
+    curve_residual = np.concatenate([
+        np.linalg.norm(file_splines[rel](arc[positions[rel]]) - rotated[positions[rel]], axis=1)
+        for rel in files])
+    curves = pd.Series(dict(arc_length_low=arc_low, arc_length_high=arc_high,
+                            range_quantile_low=q_low, range_quantile_high=q_high,
+                            row_residual_rms=float(np.sqrt(np.mean(curve_residual ** 2)))),
+                       name='template curves')
 
-    # Surface: equal-row cubic graph; origin at the mean over templates of the very_low PLS1 mean.
-    lowest = centroids.loc[centroids[STAKES].eq(cv.LEVELS[0])].set_index('source_file')['PLS1']
-    origin = float(lowest.loc[files].mean())
+    # Per-template class means in rotated PLS1-3, used only for the plots.
+    centroids = (rows.groupby(['source_file', 'template', STAKES, 'stakes_rank'], sort=False)
+                 [SURFACE_COLUMNS].mean().reset_index().sort_values(['source_file', 'stakes_rank'],
+                                                                   kind='stable'))
+
+    # Zero line: each slice's zero of arc_length_parallel is the PLS1 at which rows at the slice's
+    # height reach refined_stakes = 1 (bcpc_arc_length = arc_zero), from an equal-template fit of
+    # PLS1 on arc length, PLS3 and their product. It is linear in slice height.
+    arc_zero = float(bcpc_metadata['refined_stakes']['arc_zero'])
+    height = rotated[:, 2]
+    design = np.column_stack([np.ones(n_rows), arc, height, arc * height])
+    weight, pls1 = rows['pls_fit_weight'].to_numpy(), rotated[:, 0]
+    beta = np.linalg.lstsq(design * np.sqrt(weight)[:, None], pls1 * np.sqrt(weight), rcond=None)[0]
+    zero_line_r2 = 1 - (np.sum(weight * (pls1 - design @ beta) ** 2)
+                        / np.sum(weight * (pls1 - np.average(pls1, weights=weight)) ** 2))
+    origin = np.array([beta[0] + beta[1] * arc_zero, beta[2] + beta[3] * arc_zero])
+
+    # Surface: equal-row cubic graph, cut into slices that each start at the zero line.
     surface_points = rows[SURFACE_COLUMNS].to_numpy()
     surface = SliceSurface.fit(surface_points, origin, s.slices)
     residual = surface.evaluate(surface_points[:, [0, 2]])[:, 1] - surface_points[:, 1]
@@ -288,10 +344,13 @@ def fit_surface(run_dir, settings=None):
                           'cumulative_weighted_training_r2': pls.cumulative_r2}),
         weights=rows.groupby('register').agg(templates=('template', 'nunique'), rows=('source_row', 'size'),
                                              total_pls_weight=('pls_fit_weight', 'sum')),
-        rotation=pd.Series(rotation_diagnostics, name='centroid-plane rotation'),
+        template_curves=curves,
+        rotation=pd.Series(rotation_diagnostics, name='template-curve plane rotation'),
         surface=pd.Series(dict(rows=n_rows, design_rank=surface.fit_rank, condition=surface.fit_condition,
                                pls2_residual_rms=float(np.sqrt(np.mean(residual ** 2))),
-                               origin_pls1=origin), name='surface fit'),
+                               zero_line_arc_length=arc_zero, zero_line_pls1_at_height_0=origin[0],
+                               zero_line_pls1_per_height=origin[1], zero_line_fit_r2=float(zero_line_r2)),
+                           name='surface fit'),
         validation=pd.Series(validation, name='slice validation'),
         mapping=rows.groupby('coordinate_status').size().rename('rows').to_frame(),
         flags=rows[['surface_extended', 'height_extrapolated']].sum().rename('rows').to_frame(),
@@ -302,7 +361,7 @@ def fit_surface(run_dir, settings=None):
 
 
 def save(result, notebook=None):
-    """Write model.npz, model.json and rows.parquet to bcpc/surface/; return the folder.
+    """Write model.npz, model.json and rows.parquet to pls/; return the folder.
 
     The saved model is reloaded and must reproduce a sample of rows' coordinates from their
     raw activations before this returns.
@@ -351,14 +410,17 @@ def save(result, notebook=None):
                            total_feature_variance=pls.total_x_variance,
                            cumulative_x_variance_share=[float(v) for v in np.cumsum(pls.x_variance_share)],
                            cumulative_weighted_training_r2=[float(v) for v in pls.cumulative_r2]),
+        template_curves=dict(parameter=TARGET, **plain(result.diagnostics['template_curves'])),
         rotation=plain(result.diagnostics['rotation']),
         surface_fit=plain(result.diagnostics['surface']),
         validation=plain(result.diagnostics['validation']),
         slice_config=asdict(s.slices), file_spline_keys=file_spline_keys,
-        score_frame='centroid-plane rotation of PLS1-3; PLS4-16 unrotated; no rescaling',
+        score_frame='template-curve plane rotation of PLS1-3; PLS4-16 unrotated; no rescaling',
         coordinate_units='unscaled 3D PLS scores',
         coordinate_meaning=dict(surface_u='projected PLS1', surface_v='snapped PLS3',
-                                arc_length_parallel='signed slice length from the very_low PLS1 origin',
+                                arc_length_parallel=('signed slice length from where the slice meets the '
+                                                     'zero line (refined_stakes = 1); slice_origin holds '
+                                                     'its PLS1 as coefficients in slice height'),
                                 arc_length_orthogonal='PLS3 height relative to zero; not a geodesic length'),
         transform="(X - pls_mean) @ pls_rotations, then map PLS1-3 onto the slices",
         files={name: _sha256(directory / name) for name in ('model.npz', 'rows.parquet')},
@@ -399,7 +461,7 @@ def project_inference(config, datasets=None):
     """Map every cached inference corpus through the saved surface and BCPC bundle.
 
     Returns {dataset name: (csv path, csv rows, diagnostics)}; each CSV is written to
-    bcpc/inference/<dataset>.csv. The original inference/<dataset>/ files are not touched.
+    pls/inference/<dataset>.csv. The original inference/<dataset>/ files are not touched.
     """
     bundle = load_surface(config)
     fit, _ = bcpc_bundle.load_bcpc_bundle(config.bcpc_dir)
@@ -455,17 +517,18 @@ def _plot_rows(rows, max_rows, seed):
 
 
 def _spline_lines(result):
-    """Every template's spline as one trace with gaps, so it takes one legend entry."""
-    parameters = np.linspace(0, 1, result.settings.arc_samples)
+    """Every template's curve over its own arc-length range, as one trace with gaps, so it
+    takes one legend entry."""
     lines, labels = [], []
     for rel, spline in result.file_splines.items():
+        parameters = np.linspace(spline.t[spline.k], spline.t[-spline.k - 1], result.settings.arc_samples)
         lines.extend([spline(parameters), np.full((1, 3), np.nan)])
         labels.extend([Path(rel).stem] * (len(parameters) + 1))
     return np.vstack(lines), labels
 
 
 def plot_centroid_splines(result, max_rows=8_000, seed=42):
-    """Rotated PLS1-3 rows by stakes class, per-template class means, and their splines."""
+    """Rotated PLS1-3 rows by stakes class, per-template class means, and the template curves."""
     import plotly.graph_objects as go
 
     rows = _plot_rows(result.rows, max_rows, seed)
@@ -492,15 +555,16 @@ def plot_centroid_splines(result, max_rows=8_000, seed=42):
         hovertemplate='<b>%{customdata[1]}</b> mean<br>%{customdata[0]}<extra></extra>'))
     line, labels = _spline_lines(result)
     fig.add_trace(go.Scatter3d(
-        x=line[:, 0], y=line[:, 1], z=line[:, 2], mode='lines', name='Template splines',
+        x=line[:, 0], y=line[:, 1], z=line[:, 2], mode='lines', name=f'Template curves on {TARGET}',
         line=dict(color=INK_SECONDARY, width=3), text=labels,
-        hovertemplate='%{text}<extra>spline</extra>', connectgaps=False))
+        hovertemplate='%{text}<extra>curve</extra>', connectgaps=False))
     return style_figure(fig, f'{result.config.model_slug}: rotated PLS1-3, template class means '
-                             'and splines', ROTATED_AXIS_TITLES)
+                             'and arc-length curves', ROTATED_AXIS_TITLES)
 
 
-def plot_surface(result, max_rows=8_000, seed=42, grid_points=65, margin=0.10):
-    """The PLS2 = f(PLS1, PLS3) graph, representative height slices, and template splines."""
+def plot_surface(result, max_rows=8_000, seed=42, grid_points=129, margin=0.10):
+    """The PLS2 = f(PLS1, PLS3) graph, representative height slices, the slices' zero line,
+    and template curves."""
     import plotly.graph_objects as go
 
     rows, surface = result.rows, result.surface
@@ -513,31 +577,49 @@ def plot_surface(result, max_rows=8_000, seed=42, grid_points=65, margin=0.10):
                               'arc_length_orthogonal']].to_numpy(),
         hovertemplate=('<b>%{customdata[1]}</b><br>%{customdata[0]}<br>bcpc_arc_length %{customdata[2]:.3g}'
                        '<br>parallel %{customdata[3]:.3g}, orthogonal %{customdata[4]:.3g}<extra></extra>')))
-    xlow, xhigh = min(surface.x_bounds[0], rows.surface_u.min()), max(surface.x_bounds[1], rows.surface_u.max())
-    pad = (xhigh - xlow) * margin
-    xgrid = np.linspace(xlow - pad, xhigh + pad, grid_points)
-    zgrid = np.linspace(surface.heights[0], surface.heights[-1], grid_points)
+    # Draw the surface, slices and zero line only inside the rows' PLS1-3 box, padded on each side
+    # by `margin` of the rows' range on that axis; the cubic graph runs far outside it.
+    points = rows[SURFACE_COLUMNS].to_numpy()
+    pad = (points.max(axis=0) - points.min(axis=0)) * margin
+    low, high = points.min(axis=0) - pad, points.max(axis=0) + pad
+
+    def in_box(values):
+        values = values.copy()
+        values[np.any((values < low) | (values > high), axis=-1)] = np.nan
+        return values
+
+    xgrid = np.linspace(low[0], high[0], grid_points)
+    zgrid = np.linspace(max(low[2], surface.heights[0]), min(high[2], surface.heights[-1]), grid_points)
     u, v = np.meshgrid(xgrid, zgrid)
-    mesh = surface.evaluate(np.column_stack([u.ravel(), v.ravel()])).reshape(grid_points, grid_points, 3)
+    mesh = in_box(surface.evaluate(np.column_stack([u.ravel(), v.ravel()]))).reshape(grid_points, grid_points, 3)
     fig.add_trace(go.Surface(x=mesh[:, :, 0], y=mesh[:, :, 1], z=mesh[:, :, 2], opacity=0.35,
                              showscale=False, colorscale=[[0, BASELINE], [1, BASELINE]],
                              name='Graph with tangent extensions', showlegend=True, hoverinfo='skip'))
     for n, i in enumerate(np.unique(np.linspace(0, len(surface.heights) - 1, 9).astype(int))):
-        line = surface.evaluate(np.column_stack([xgrid, np.full(len(xgrid), surface.heights[i])]))
+        line = in_box(surface.evaluate(np.column_stack([xgrid, np.full(len(xgrid), surface.heights[i])])))
         fig.add_trace(go.Scatter3d(x=line[:, 0], y=line[:, 1], z=line[:, 2], mode='lines',
                                    name='Height slices', legendgroup='slices', showlegend=n == 0,
+                                   connectgaps=False,
                                    line=dict(color=INK_SECONDARY, width=3),
                                    hovertemplate=f'Slice {i}<br>PLS3 {surface.heights[i]:.3g}<extra></extra>'))
+    # Every slice's zero of arc_length_parallel, which lies on the surface.
+    zero_heights = np.linspace(surface.heights[0], surface.heights[-1], grid_points)
+    zero = in_box(surface.evaluate(np.column_stack([surface.origin_u(zero_heights), zero_heights])))
+    fig.add_trace(go.Scatter3d(x=zero[:, 0], y=zero[:, 1], z=zero[:, 2], mode='lines',
+                               name='Slice zeros (refined_stakes = 1)', connectgaps=False,
+                               line=dict(color=ZERO_LINE_COLOR, width=6),
+                               hovertemplate=('arc_length_parallel = 0<br>PLS1 %{x:.3g}, PLS3 %{z:.3g}'
+                                              '<extra></extra>')))
     line, labels = _spline_lines(result)
     fig.add_trace(go.Scatter3d(x=line[:, 0], y=line[:, 1], z=line[:, 2], mode='lines',
-                               name='Template splines', line=dict(color=INK, width=4), text=labels,
-                               hovertemplate='%{text}<extra>spline</extra>', connectgaps=False))
-    return style_figure(fig, f'{result.config.model_slug}: PLS2 = f(PLS1, PLS3) and height slices',
+                               name='Template curves', line=dict(color=INK, width=4), text=labels,
+                               hovertemplate='%{text}<extra>curve</extra>', connectgaps=False))
+    return style_figure(fig, f'{result.config.model_slug}: PLS2 = f(PLS1, PLS3), height slices and slice zeros',
                         ROTATED_AXIS_TITLES)
 
 
 def save_plots(result, max_rows=8_000, seed=42):
-    """Write every figure as self-contained HTML to bcpc/surface/plots/; return {name: figure}."""
+    """Write every figure as self-contained HTML to pls/plots/; return {name: figure}."""
     plots_dir = surface_dir(result.config) / 'plots'
     plots_dir.mkdir(parents=True, exist_ok=True)
     figures = {

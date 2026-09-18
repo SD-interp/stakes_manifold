@@ -7,7 +7,8 @@ One folder per model, `RunConfig.bcpc_dir` (`artifacts/<model>/bcpc/`):
                   coefficients, and each class centre's refined stakes
 - `model.json`    settings, orientation, the refined-stakes scale, cross-validation
                   summaries, the fitted cache files, code and file checksums
-- `rows.parquet`  every horizon-free row scored by the full fit alone: BCPC scores,
+- `rows.parquet`  every horizon-free row scored by the full fit alone, with its prompt text
+                  (`prompt`, as the activation cache recorded it): BCPC scores,
                   `bcpc_arc_length`, `refined_stakes`, `refined_residual`, and `cv_fold`
 - `excluded_rows.parquet`  the same columns, except `cv_fold`, for the rows of
                   `cv.EXCLUDED_TEMPLATES`, which the fit never saw

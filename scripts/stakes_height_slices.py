@@ -83,17 +83,25 @@ class SliceConfig:
 
 
 class SliceSurface:
+    """PLS2 = f(PLS1, PLS3) cut into fixed-PLS3 slices.
+
+    `origin` places each slice's zero of `arc_length_parallel`: the PLS1 of that zero as
+    polynomial coefficients in slice height, lowest degree first. A scalar gives every slice
+    the same zero PLS1.
+    """
+
     def __init__(self, center, scale, coefficients, x_bounds, z_bounds, origin, config=None):
         self.center = np.asarray(center, dtype=float)
         self.scale = np.asarray(scale, dtype=float)
         self.coefficients = np.asarray(coefficients, dtype=float)
         self.x_bounds = np.asarray(x_bounds, dtype=float)
         self.z_bounds = np.asarray(z_bounds, dtype=float)
-        self.origin = float(origin)
+        self.origin = np.atleast_1d(np.asarray(origin, dtype=float))
         self.config = config or SliceConfig()
         if (self.center.shape != (2,) or self.scale.shape != (2,)
                 or self.coefficients.shape != (4, 4) or self.x_bounds.shape != (2,)
                 or self.z_bounds.shape != (2,) or np.any(self.scale <= 0)
+                or self.origin.ndim != 1 or not len(self.origin)
                 or self.x_bounds[0] >= self.x_bounds[1] or self.z_bounds[0] > self.z_bounds[1]
                 or not all(np.isfinite(a).all() for a in
                            (self.center, self.scale, self.coefficients, self.x_bounds,
@@ -122,6 +130,10 @@ class SliceSurface:
         surface.fit_rank = int(rank)
         surface.fit_condition = float(singular[0] / singular[-1]) if singular[-1] > 0 else float('inf')
         return surface
+
+    def origin_u(self, heights):
+        """PLS1 of the zero of `arc_length_parallel` on the slices at `heights`."""
+        return poly.polyval(np.asarray(heights, dtype=float), self.origin)
 
     def curve_coefficients(self, heights):
         z = (np.asarray(heights) - self.center[1]) / self.scale[1]
@@ -283,7 +295,7 @@ class SliceSurface:
                 x = self.center[0]+self.scale[0]*t
                 z = self.heights[indices]
                 projected = self.evaluate(np.column_stack([x, z]))
-                origin = np.full(len(batch), (self.origin-self.center[0])/self.scale[0])
+                origin = (self.origin_u(z)-self.center[0])/self.scale[0]
                 result = dict(surface_u=x, surface_v=z,
                     arc_length_parallel=self._arc(indices, t)-self._arc(indices, origin),
                     arc_length_orthogonal=z.copy(),
@@ -355,10 +367,10 @@ def validate_slice_mapping(model, points):
     elapsed = time.perf_counter()-started
     lo, hi = model.t_bounds
     sx, cx = model.scale[0], model.center[0]
-    origin = (model.origin-cx)/sx
     arc_errors, projection_errors = [], []
     for i, point in enumerate(points):
         c = model.curves[result['slice_index'][i]]
+        origin = (model.origin_u(model.heights[result['slice_index'][i]])-cx)/sx
         derivative = poly.polyder(c)
 
         def y(t):

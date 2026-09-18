@@ -52,7 +52,7 @@ LEVELS = tuple(level for level in STAKES_LEVELS if level not in STAKES_MERGES)
 N_CLASSES = len(LEVELS)
 CHUNK_ROWS = 1024
 ROW_COLUMNS = ['source_file', 'source_row', 'template_id', 'template', 'register', 'task',
-               'stakes', 'stakes_original', 'stakes_rank']
+               'prompt', 'stakes', 'stakes_original', 'stakes_rank']
 # Templates left out of every fit, named as the cache stem without its content hash.
 # Neither is a request (one is a form, the other a document ending on a colon), and in
 # every model their stakes direction sits furthest from the one the other templates share.
@@ -132,7 +132,8 @@ def load_model(run_dir, excluded=False):
     unknown = set(rows['stakes_original']) - set(STAKES_LEVELS)
     if unknown:
         raise ValueError(f'Unknown stakes levels: {sorted(unknown)}')
-    rows = rows[['source_file', 'source_row', 'template_id', 'task', 'stakes', 'stakes_original']].copy()
+    rows = rows[['source_file', 'source_row', 'template_id', 'task', 'prompt', 'stakes',
+                 'stakes_original']].copy()
     rows['template'] = rows['source_file'].map(lambda rel: PurePosixPath(rel).stem)
     rows['register'] = rows['template'].str.split('--').str[0]
     rows['stakes_rank'] = rows['stakes'].map({level: i + 1 for i, level in enumerate(LEVELS)}).astype(int)
