@@ -19,6 +19,9 @@ class ChatTemplateTokenizer:
         tokenizer (PreTrainedTokenizer): The Hugging Face tokenizer to wrap.
         suffix (str, optional): A suffix to append to the formatted prompt. Defaults to "".
         system_prompt (str, optional): The system prompt to use. Defaults to "You are a strategic planning assistant that follows user instructions carefully".
+        send_empty_system_prompt (bool, optional): Send the system message even when
+            `system_prompt` is empty. Templates such as Mistral 3's substitute their own
+            default system prompt when none is sent. Defaults to False.
     """
 
     def __init__(
@@ -26,12 +29,14 @@ class ChatTemplateTokenizer:
         tokenizer: PreTrainedTokenizer,
         suffix: str = "",
         system_prompt: str = "",
+        send_empty_system_prompt: bool = False,
     ):
         self.tokenizer = tokenizer
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.system_prompt: str = system_prompt
+        self.send_empty_system_prompt = send_empty_system_prompt
         self.structured_prompt: list[str] | None = None
         self.suffix = suffix
 
@@ -54,7 +59,7 @@ class ChatTemplateTokenizer:
         instruct_syntax_prompts = [
             (
                 ([{"role": "system", "content": self.system_prompt}]
-                 if self.system_prompt
+                 if self.system_prompt or self.send_empty_system_prompt
                  else [])
                 + [{"role": "user", "content": user_prompt}]
             )

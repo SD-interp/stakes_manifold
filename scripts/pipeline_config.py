@@ -34,6 +34,7 @@ SHARED_SETTINGS = ('model_name', 'naming_convention', 'layer_component', 'positi
 NAMING_CONVENTIONS = {
     'llama': ('num_hidden_layers', 'model.layers.{layer}'),
     'gemma4': ('text_config.num_hidden_layers', 'model.language_model.layers.{layer}'),
+    'mistral3': ('text_config.num_hidden_layers', 'model.language_model.layers.{layer}'),
 }
 
 
