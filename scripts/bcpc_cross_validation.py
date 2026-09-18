@@ -21,10 +21,11 @@ other pair of classes. Every BCPC direction is oriented so the `existential` cen
 scores positive, `existential` is the positive end of the refined scale and of the
 difference-of-means line, and `very_low` is the negative end. Nothing is written to disk.
 
-Every average across templates gives each dataset (register) equal total weight, split
-equally among its templates, so a dataset with more templates does not dominate. This
-covers the class means, the spline's class medians, the held-out geometry and the task
-averages. The surface pipeline instead weights each template file equally.
+The templates in `EXCLUDED_TEMPLATES` never enter a fit; see the comment there.
+
+Every average across templates gives each template equal total weight, split equally
+among its rows, as the old surface pipeline did. This covers the class means, the
+spline's class medians, the held-out geometry and the task averages.
 
 Activations are held in float64, about 0.7 GB for a 5,376-wide model. The between-class
 scatter is M^T M with M the K x d matrix of mass-weighted centred class means, so its
@@ -38,7 +39,7 @@ import numpy as np
 import pandas as pd
 
 from .bcpc_arc_length import BcpcArcLength, BcpcSettings
-from .cache_inventory import CacheInventory
+from .cache_inventory import CacheInventory, cache_signature
 from .corpora.training.base_task_set import STAKES_LEVELS
 from .pipeline_config import load_run_config
 
@@ -49,6 +50,13 @@ STAKES_MERGES = {'near_existential': 'existential'}
 LEVELS = tuple(level for level in STAKES_LEVELS if level not in STAKES_MERGES)
 N_CLASSES = len(LEVELS)
 CHUNK_ROWS = 1024
+ROW_COLUMNS = ['source_file', 'source_row', 'template_id', 'template', 'register', 'task',
+               'stakes', 'stakes_original', 'stakes_rank']
+# Templates left out of every fit, named as the cache stem without its content hash.
+# Neither is a request (one is a form, the other a document ending on a colon), and in
+# every model their stakes direction sits furthest from the one the other templates share.
+# They are reported as a limitation of the method instead.
+EXCLUDED_TEMPLATES = ('conversational_no_time--brief', 'conversational_no_time--notes_heading')
 
 
 @dataclass
@@ -56,6 +64,8 @@ class ModelActivations:
     name: str
     rows: pd.DataFrame      # one row per activation, aligned with X
     X: np.ndarray           # (rows, features) float64
+    config: object = None   # the RunConfig the caches were read with
+    sources: list = None    # per fitted cache file: path, size, mtime_ns and rows
 
 
 @dataclass
@@ -89,6 +99,10 @@ class ModelResult:
     stability: pd.Series
     curve: BcpcArcLength        # the in-sample spline, for plotting
     anchors: pd.DataFrame       # every fit's spline end anchors in BCPC1-3, for plotting
+    full: FoldFit = None        # the fit on every row: the model the pipeline uses
+    full_rows: pd.DataFrame = None  # every row scored by `full` alone, with its fold
+    provenance: dict = None     # run settings and fitted cache files
+    settings: dict = None       # folds, seed and components of this cross-validation
 
 
 def load_model(run_dir):
@@ -97,11 +111,16 @@ def load_model(run_dir):
     # STAKES_MERGES replaces the run config's merges, whatever the caching pass recorded.
     inventory = CacheInventory(config.activations_dir, config.model_name, config.layer_component,
                                config.position, STAKES_MERGES, key_root=config.run_dir)
-    frames = [inventory.entries[rel]['frame'] for rel in inventory.fit_files]
+    names = {rel: PurePosixPath(rel).stem.rsplit('-', 1)[0] for rel in inventory.fit_files}
+    missing = set(EXCLUDED_TEMPLATES) - set(names.values())
+    if missing:
+        raise ValueError(f'Excluded templates not found in {config.activations_dir}: {sorted(missing)}')
+    fit_files = [rel for rel in inventory.fit_files if names[rel] not in EXCLUDED_TEMPLATES]
+    frames = [inventory.entries[rel]['frame'] for rel in fit_files]
     rows = pd.concat(frames, ignore_index=True)
     X = np.empty((len(rows), inventory.feature_count), dtype=np.float64)
     offset = 0
-    for rel, frame in zip(inventory.fit_files, frames):
+    for rel, frame in zip(fit_files, frames):
         for start, stop, block in inventory.batches(rel):
             X[offset + start:offset + stop] = block
         offset += len(frame)
@@ -114,7 +133,11 @@ def load_model(run_dir):
     rows['register'] = rows['template'].str.split('--').str[0]
     rows['stakes_rank'] = rows['stakes'].map({level: i + 1 for i, level in enumerate(LEVELS)}).astype(int)
     rows['class_index'] = rows['stakes_rank'] - 1
-    return ModelActivations(config.model_slug, rows, X)
+    sources = [dict(source_file=rel, path=str(inventory.entries[rel]['path']),
+                    size=inventory.entries[rel]['signature'][0],
+                    mtime_ns=inventory.entries[rel]['signature'][1], rows=len(frame))
+               for rel, frame in zip(fit_files, frames)]
+    return ModelActivations(config.model_slug, rows, X, config, sources)
 
 
 def stratified_folds(keys, strata, n_folds, seed):
@@ -143,16 +166,14 @@ def fold_composition(rows, folds):
     return pd.crosstab(tasks['stakes'], tasks['fold']).reindex(LEVELS)
 
 
-def dataset_weights(frame, by=()):
+def template_weights(frame, by=()):
     """Row weights summing to one within each `by` group, or over all rows if none: equal
-    total per dataset (register), split equally among its templates present, then among
-    each template's rows."""
+    total per template present, split equally among its rows."""
     by = list(by)
-    registers = (frame.groupby(by, sort=False)['register'].transform('nunique') if by
-                 else frame['register'].nunique())
-    templates = frame.groupby(by + ['register'], sort=False)['template'].transform('nunique')
+    templates = (frame.groupby(by, sort=False)['template'].transform('nunique') if by
+                 else frame['template'].nunique())
     rows_per_template = frame.groupby(by + ['template'], sort=False)['template'].transform('size')
-    return (1.0 / (registers * templates * rows_per_template)).to_numpy()
+    return (1.0 / (templates * rows_per_template)).to_numpy()
 
 
 def _weighted_sums(values, weights, keys):
@@ -161,8 +182,8 @@ def _weighted_sums(values, weights, keys):
 
 
 def class_means(data, index, chunk_rows=CHUNK_ROWS):
-    """Dataset-weighted means of every stakes class over `index`; (means, class mass)."""
-    weights = dataset_weights(data.rows.iloc[index])
+    """Template-weighted means of every stakes class over `index`; (means, class mass)."""
+    weights = template_weights(data.rows.iloc[index])
     class_index = data.rows['class_index'].to_numpy()[index]
     mass = np.bincount(class_index, weights=weights, minlength=N_CLASSES)
     if (mass <= 0).any():
@@ -209,14 +230,17 @@ def arc_length(curve, scores):
     return curve.batch_arc_length(scores)
 
 
-def fit_fold(data, index, n_components=None):
-    """BCPC, its arc-length spline, and the refined-stakes scale from `index` alone."""
+def fit_fold(data, index, n_components=None, spline=None):
+    """BCPC, its arc-length spline, and the refined-stakes scale from `index` alone.
+
+    `spline` holds `BcpcSettings` fields other than `n_components`; unset ones keep their defaults.
+    """
     bcpc = fit_bcpc(data, index, n_components)
     scores = project(data, index, bcpc)
     projection = dict(mean=bcpc.mean, components=bcpc.components, eigenvalues=bcpc.eigenvalues,
                       classes=np.array(LEVELS), class_mass=bcpc.class_mass)
-    curve = BcpcArcLength(BcpcSettings(n_components=scores.shape[1])).fit_curve(
-        projection, scores, dataset_weights(data.rows.iloc[index]),
+    curve = BcpcArcLength(BcpcSettings(n_components=scores.shape[1], **(spline or {}))).fit_curve(
+        projection, scores, template_weights(data.rows.iloc[index]),
         data.rows['class_index'].to_numpy()[index])
     class_arc = arc_length(curve, curve.centroids.loc[list(LEVELS), curve.score_columns].to_numpy())
     zero = class_arc[LEVELS.index(NEGATIVE_ANCHOR)]
@@ -256,15 +280,25 @@ def retained_geometry(data, held_out, half, fit):
     return bcpc, dom, total
 
 
-def cross_validate(data, folds, seed, n_components=None):
-    """In-sample fit, then every task fold, scoring all rows in every fit."""
+def cross_validate(data, folds, seed, n_components=None, spline=None):
+    """In-sample fit, then every task fold, scoring all rows in every fit.
+
+    The in-sample fit on every row is the model the pipeline uses: `full_rows` holds each
+    row's scores, arc length and refined stakes from it alone. The fold fits are diagnostics.
+    """
     rows = data.rows
     everything = np.arange(len(rows))
     label = rows['class_index'].to_numpy()
-    full = fit_fold(data, everything, n_components)
+    full = fit_fold(data, everything, n_components, spline)
     scores = project(data, everything, full.bcpc)
+    full_arc = arc_length(full.curve, scores)
+    full_refined = full.refined(full_arc)
+    full_rows = rows[ROW_COLUMNS].assign(
+        cv_fold=folds, **{column: scores[:, j] for j, column in enumerate(full.curve.score_columns)},
+        bcpc_arc_length=full_arc, refined_stakes=full_refined,
+        refined_residual=full_refined - full.class_refined[label])
     frames = [pd.DataFrame(scores[:, :3], columns=['BCPC1', 'BCPC2', 'BCPC3']).assign(
-        refined=full.refined(arc_length(full.curve, scores)), fit='in_sample', fold=-1, row=everything)]
+        refined=full_refined, fit='in_sample', fold=-1, row=everything)]
     anchors = [_anchor_frame(full.curve, 'in_sample', -1)]
     template_half = rows['source_file'].map(
         stratified_folds(rows['source_file'], rows['register'], 2, seed)).to_numpy()
@@ -275,7 +309,7 @@ def cross_validate(data, folds, seed, n_components=None):
     retention, fold_components = [], []
     for fold in range(n_folds):
         held_out = np.flatnonzero(folds == fold)
-        fit = fit_fold(data, np.flatnonzero(folds != fold), n_components)
+        fit = fit_fold(data, np.flatnonzero(folds != fold), n_components, spline)
         fold_components.append(fit.bcpc.components)
         anchors.append(_anchor_frame(fit.curve, 'held_out', fold))
         scores = project(data, everything, fit.bcpc)
@@ -298,9 +332,17 @@ def cross_validate(data, folds, seed, n_components=None):
         residual=residual[folds, everything],
         residual_in_training=np.where(own, 0.0, residual).sum(axis=0) / (~own).sum(axis=0),
         template_half=template_half)
+    provenance = None
+    if data.config is not None:
+        provenance = dict(model_name=data.config.model_name, model_slug=data.config.model_slug,
+                          run_dir=str(data.config.run_dir),
+                          layer_component=data.config.layer_component,
+                          position=data.config.position, rows=len(rows),
+                          features=int(data.X.shape[1]), sources=data.sources)
+    settings = dict(n_folds=int(n_folds), seed=int(seed), n_components=full.bcpc.components.shape[1])
     return ModelResult(rows, pd.concat(frames, ignore_index=True), pd.DataFrame(retention),
                        refinement, component_stability(fold_components), full.curve,
-                       pd.concat(anchors, ignore_index=True))
+                       pd.concat(anchors, ignore_index=True), full, full_rows, provenance, settings)
 
 
 def _anchor_frame(curve, fit_label, fold):
@@ -328,12 +370,12 @@ def retention_summary(retention, dimensions=(1, 2, 3, 5, N_CLASSES - 1)):
 
 
 def task_refinement(frame):
-    """Per task, dataset-weighted over its templates: held-out refined stakes, its residual
+    """Per task, averaged with equal weight over its templates: held-out refined stakes, its residual
     from the class centre, the residual when the task's rows were in training, and how
     consistently templates agree on it. The standard error behind `t` uses the weights'
     effective sample size."""
     task = frame['task']
-    weights = dataset_weights(frame, ['task'])
+    weights = template_weights(frame, ['task'])
     tasks = frame.groupby('task', sort=False).agg(
         stakes=('stakes', 'first'), stakes_original=('stakes_original', 'first'),
         stakes_rank=('stakes_rank', 'first'), templates=('residual', 'size'))
@@ -361,7 +403,7 @@ def refinement_summary(frame):
     """
     tasks = task_refinement(frame)
     halves = _weighted_sums(frame[['residual', 'refined']],
-                            dataset_weights(frame, ['task', 'template_half']),
+                            template_weights(frame, ['task', 'template_half']),
                             [frame['task'], frame['template_half']]).unstack()
     return pd.Series(dict(
         refinement_sd=tasks['residual'].std(),
@@ -388,15 +430,15 @@ FIT_CAPTIONS = {'in_sample': 'in-sample fit', 'held_out': 'held-out tasks'}
 def anchor_proximity(result, fit_label='held_out', levels=('very_high', 'catastrophic'),
                      reference='catastrophic'):
     """Per task labelled one of `levels`, in BCPC1-3 as one `plot_scores` panel draws them:
-    the distance from the task's dataset-weighted mean to its fit's positive spline anchor,
+    the distance from the task's template-weighted mean to its fit's positive spline anchor,
     and to the panel's `reference` class mean. Held out, a task is placed in its own fold's
     basis against that fold's anchor, while the class mean pools every fold's held-out rows,
     as the plotted circle does."""
     frame = result.scores.loc[result.scores['fit'].eq(fit_label)].reset_index(drop=True)
     frame = frame.join(result.rows[['stakes', 'task', 'template', 'register']], on='row')
-    means = _weighted_sums(frame[SCORE_AXES], dataset_weights(frame, ['stakes']), frame['stakes'])
+    means = _weighted_sums(frame[SCORE_AXES], template_weights(frame, ['stakes']), frame['stakes'])
     chosen = frame.loc[frame['stakes'].isin(levels)]
-    points = _weighted_sums(chosen[SCORE_AXES], dataset_weights(chosen, ['task']), chosen['task'])
+    points = _weighted_sums(chosen[SCORE_AXES], template_weights(chosen, ['task']), chosen['task'])
     tasks = chosen.groupby('task', sort=False)[['stakes', 'fold']].first().loc[points.index]
 
     anchors = result.anchors.loc[result.anchors['fit'].eq(fit_label)
@@ -420,7 +462,7 @@ def _score_traces(result, fit_label, max_rows, seed, legend):
     frame = result.scores.loc[result.scores['fit'].eq(fit_label)].reset_index(drop=True)
     frame = frame.join(result.rows[['stakes', 'task', 'template', 'register']], on='row')
     colors = stakes_colors(LEVELS)
-    means = _weighted_sums(frame[SCORE_AXES], dataset_weights(frame, ['stakes']),
+    means = _weighted_sums(frame[SCORE_AXES], template_weights(frame, ['stakes']),
                            frame['stakes']).reindex(LEVELS)
     shown = frame if max_rows is None or len(frame) <= max_rows else frame.sample(max_rows, random_state=seed)
 

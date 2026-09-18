@@ -1,8 +1,10 @@
 """Configuration shared by every stage of the arc-coordinate pipeline.
 
 All generated files for one model live under `artifacts/<model slug>/`:
-`datasets/` (prompt JSON), `activations/` (template caches), `surface/`
-(rows.parquet, model.npz, model.json, mapping checkpoints), and `plots/` (HTML figures).
+`datasets/` (prompt JSON), `activations/` (template caches), `bcpc/` (the full-fit
+BCPC and arc-length spline: rows.parquet, model.npz, model.json, and `plot_data/` from the
+out-of-fold check), `surface/` (rows.parquet, model.npz, model.json, mapping checkpoints),
+and `plots/` (HTML figures).
 """
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -110,6 +112,10 @@ class RunConfig:
     @property
     def activations_dir(self):
         return self.run_dir / 'activations'
+
+    @property
+    def bcpc_dir(self):
+        return self.run_dir / 'bcpc'
 
     @property
     def surface_dir(self):

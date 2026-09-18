@@ -26,8 +26,12 @@ def _check_bundle(config, metadata):
             raise ValueError(f'Surface/config {key} mismatch.')
 
 
-def project_caches(config, records, paths, *, row_fields, csv_columns, bundle=None):
-    """Return ordered CSV rows and diagnostics, joining by template/cache row identity."""
+def project_caches(config, records, paths, *, row_fields, csv_columns, bundle=None, scores=None):
+    """Return ordered CSV rows and diagnostics, joining by template/cache row identity.
+
+    `scores`, if given, maps a float64 activation batch to {column: per-row values},
+    added beside the surface coordinates and checked finite with them.
+    """
     import torch
     arrays, metadata, coordinates = bundle or load_surface_bundle(config.surface_dir)
     _check_bundle(config, metadata)
@@ -35,6 +39,7 @@ def project_caches(config, records, paths, *, row_fields, csv_columns, bundle=No
     expected = {(tid, row): record for tid, group in groups.items() for row, record in enumerate(group)}
     projected = {}
     source_keys = set()
+    extra_columns = []
     for path in paths:
         path = Path(path).resolve()
         cached = torch.load(path, map_location='cpu', weights_only=False, mmap=True)
@@ -54,9 +59,11 @@ def project_caches(config, records, paths, *, row_fields, csv_columns, bundle=No
         if tensor.shape != (len(rows), 1, metadata['feature_count']) or not tensor.is_floating_point():
             raise ValueError(f'Activation width/shape mismatch: {path}')
         X = tensor[:, 0, :].to(torch.float64).numpy()
-        scores = (X - arrays['pls_mean']) @ arrays['pls_rotations']
-        mapped = coordinates.map_points(scores[:, :3], progress_seconds=None)
-        outside = (scores[:, 2] < coordinates.heights[0]) | (scores[:, 2] > coordinates.heights[-1])
+        pls_scores = (X - arrays['pls_mean']) @ arrays['pls_rotations']
+        mapped = coordinates.map_points(pls_scores[:, :3], progress_seconds=None)
+        outside = (pls_scores[:, 2] < coordinates.heights[0]) | (pls_scores[:, 2] > coordinates.heights[-1])
+        extra = scores(X) if scores is not None else {}
+        extra_columns = list(extra)
         template_ids = {r['template_id'] for r in rows}
         if len(template_ids) != 1:
             raise ValueError(f'Expected one template per cache: {path}')
@@ -71,12 +78,13 @@ def project_caches(config, records, paths, *, row_fields, csv_columns, bundle=No
                 source_file=str(path), source_row=source_row,
                 outside_saved_height_range=bool(outside[source_row]),
                 **{name: values[source_row] for name, values in mapped.items()},
+                **{name: values[source_row] for name, values in extra.items()},
             )
     if projected.keys() != expected.keys():
         raise ValueError('Missing inference cache rows.')
     diagnostics = pd.DataFrame([projected[key] for key in expected])
     result = diagnostics[csv_columns].copy()
-    if not np.isfinite(result[COORDINATE_COLUMNS].to_numpy()).all():
+    if not np.isfinite(diagnostics[[*COORDINATE_COLUMNS, *extra_columns]].to_numpy(dtype=float)).all():
         raise RuntimeError('Nonfinite inference coordinates; CSV export aborted.')
     return result, diagnostics
 

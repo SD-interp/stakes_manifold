@@ -132,6 +132,28 @@ class BcpcArcLength:
                                                 for u in self.spline_curve['parameter']]
         return self
 
+    @classmethod
+    def restore(cls, settings, projection, centroids, anchors, knots, coefficients):
+        """Rebuild a fitted curve from saved arrays without refitting.
+
+        `centroids` and `anchors` are the saved frames whose columns are the score columns;
+        `knots` and `coefficients` are `curve.t` and `curve.c`. Orientation and arc-length
+        tables are recomputed from them exactly as `fit_curve` computes them.
+        """
+        self = cls(settings)
+        self.projection = projection
+        self.score_columns = list(centroids.columns)
+        self.centroids = centroids
+        self.anchors = anchors
+        self.curve = BSpline(np.asarray(knots), np.asarray(coefficients), settings.degree)
+        parameter = np.linspace(0.0, 1.0, settings.curve_points)
+        self.spline_curve = pd.DataFrame(self.curve(parameter), columns=self.score_columns)
+        self.spline_curve.insert(0, 'parameter', parameter)
+        self._orient()
+        self.spline_curve['bcpc_arc_length'] = [self.arc_length_at(u)
+                                                for u in self.spline_curve['parameter']]
+        return self
+
     def class_table(self):
         return pd.DataFrame({'class': self.projection['classes'],
                              'weight': self.projection['class_mass']})
