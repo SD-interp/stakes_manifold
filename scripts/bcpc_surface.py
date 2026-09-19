@@ -31,6 +31,8 @@ evaluations.
 Output, in `artifacts/<model>/pls/` beside the BCPC bundle:
 
 - `pls/`            model.npz, model.json, rows.parquet (with each row's `prompt` text) and plots/
+- `pls/shape/`      the fitted shape alone (`fit_shape`, `save_shape`): model.npz, model.json,
+                    rows.parquet and shape.html, without the u map or (u, v) coordinates
 - `pls/inference/`  one CSV per cached inference corpus, with the surface coordinates and
                     the bundle's `bcpc_arc_length` and `refined_stakes`
 """
@@ -49,10 +51,13 @@ from . import bcpc_cross_validation as cv
 from . import cache_activations, inference_datasets, inference_projection
 from . import geometric_surface as gs
 from .pipeline_config import ROOT
-from .pls_fit import WeightedPls
+from .pls_fit import WeightedPls, pls1_gram
+from .weighted_pls_statistics import WeightedStatistics
 
 SCHEMA_VERSION = 3  # 3: geometric surface in all PLS components, orthogonal (u, v)
 GEOMETRY_TYPE = 'bcpc_pls_geometric_surface'
+SHAPE_SCHEMA_VERSION = 1  # the fitted shape alone, in pls/shape/
+SHAPE_GEOMETRY_TYPE = 'bcpc_pls_surface_shape'
 TARGET = 'bcpc_arc_length'
 BCPC_COLUMNS = ['bcpc_arc_length', 'refined_stakes']
 # Bundle columns that come from the hand-assigned classes; the surface stage drops them.
@@ -63,7 +68,8 @@ CODE_FILES = ('scripts/bcpc_surface.py', 'scripts/geometric_surface.py', 'script
               'scripts/inference_projection.py')
 WEIGHTING = dict(
     pls='equal total weight per template file, split equally among its rows',
-    shape='equal total weight per template file, split equally among its rows',
+    shape='equal total weight per template file, split equally among its rows, times '
+          '1 + surface.outer_weight * (distance from the weighted centroid) / (its weighted RMS)',
     u_map='equal total weight per template file, split equally among its rows')
 
 # Plot palette on a light chart surface. Continuous values take the blue sequential ramp.
@@ -228,6 +234,134 @@ def fit_pls(run_dir, settings=None):
     return config, bcpc_metadata, rows, pls, X
 
 
+def task_folds(rows, folds, seed):
+    """A fold per task, stratified by the task's weighted mean `bcpc_arc_length`.
+
+    Tasks are sorted by that mean and dealt, one block of `folds` at a time, to the folds in
+    a random order, so every fold spans the whole arc-length range. Returns each row's fold.
+    """
+    weight = rows['pls_fit_weight']
+    mean_arc = (rows[TARGET] * weight).groupby(rows['task']).sum() / weight.groupby(rows['task']).sum()
+    rng = np.random.default_rng(seed)
+    order = mean_arc.sort_values(kind='stable').index
+    fold_of_task = pd.Series(np.concatenate([rng.permutation(folds) for _ in range(0, len(order), folds)])
+                             [:len(order)], index=order)
+    return rows['task'].map(fold_of_task).to_numpy()
+
+
+def select_pls_components(run_dir, settings=None, max_components=30, folds=5, repeats=3, seed=42,
+                          chunk_rows=1024):
+    """Cross-validated choice of the number of PLS components.
+
+    Criterion: how well the first k components predict `bcpc_arc_length` on held-out tasks,
+    with the PLS fitted on the other tasks exactly as `fit_pls` fits it (same weights). Folds
+    hold out whole tasks (every template of a task together), stratified by task mean arc
+    length (`task_folds`), repeated `repeats` times with different fold draws. Each training
+    fit comes from the full data's weighted cross-products minus the held-out fold's.
+
+    Returns (summary, folds) DataFrames. `folds` has the held-out weighted mean squared
+    error of every (repeat, fold, components), 0 components being the training mean.
+    `summary`, per component count: the mean CV MSE over repeats, its standard error (fold
+    MSEs' standard deviation / sqrt(folds), averaged over repeats), Q2 = 1 - MSE / MSE(0),
+    and the full-data fit's in-sample R2 and cumulative feature-variance share. Its attrs
+    hold `best` (lowest mean CV MSE) and `one_se` (fewest components whose mean CV MSE is
+    within one standard error of the best: the one-standard-error rule).
+    """
+    s = settings or SurfaceSettings()
+    _, _, rows, X = _load_rows(run_dir, s.include_excluded_templates)
+    y, w = rows[TARGET].to_numpy(dtype=np.float64), rows['pls_fit_weight'].to_numpy(dtype=np.float64)
+
+    def statistics(index):
+        stats = WeightedStatistics(X.shape[1])
+        for start in range(0, len(index), chunk_rows):
+            part = index[start:start + chunk_rows]
+            stats.add(X[part], y[part], w[part])
+        return stats
+
+    def coefficient_path(stats):
+        """Intercepts (K + 1,) and coefficients (features, K + 1) of the 0..K component fits,
+        with the fit's centred cross-products, rotations and loadings."""
+        C, cross, _, x_mean, y_mean = stats.centred()
+        weights, loadings, target_loadings = pls1_gram(C, cross, max_components)
+        # P'W is upper triangular, so the first k rotations are the k-component model's.
+        rotations = weights @ np.linalg.inv(loadings.T @ weights)
+        beta = np.column_stack([np.zeros(len(x_mean)), np.cumsum(rotations * target_loadings, axis=1)])
+        return y_mean - x_mean @ beta, beta, C, cross, rotations, loadings
+
+    # The full-data fit: in-sample R2 and feature-variance shares, as `WeightedPls` reports them.
+    everything = statistics(np.arange(len(rows)))
+    _, beta_full, C, cross, rotations, loadings = coefficient_path(everything)
+    y_variance = everything.centred()[2]
+    in_sample_r2 = [1 - (y_variance - 2 * b @ cross + b @ C @ b) / y_variance for b in beta_full.T]
+    component_variances = np.einsum('fk,fg,gk->k', rotations, C, rotations)
+    x_share = np.r_[0.0, np.cumsum(component_variances * (loadings ** 2).sum(0) / np.trace(C))]
+    del C
+
+    records = []
+    for repeat in range(repeats):
+        fold_of_row = task_folds(rows, folds, seed + repeat)
+        for fold in range(folds):
+            held = np.flatnonzero(fold_of_row == fold)
+            intercepts, beta, *_ = coefficient_path(everything - statistics(held))
+            residual = y[held, None] - intercepts - X[held] @ beta
+            mse = (w[held] @ residual ** 2) / w[held].sum()
+            records += [dict(repeat=repeat, fold=fold, components=k, held_out_tasks=int(rows['task'].iloc[held].nunique()),
+                             cv_mse=float(value)) for k, value in enumerate(mse)]
+    fold_table = pd.DataFrame(records)
+
+    per_repeat = fold_table.groupby(['repeat', 'components'])['cv_mse'].agg(['mean', 'std'])
+    per_repeat['se'] = per_repeat['std'] / np.sqrt(folds)
+    summary = per_repeat.groupby('components')[['mean', 'se']].mean().rename(columns={'mean': 'cv_mse', 'se': 'cv_mse_se'})
+    # Paired on the same folds: how much the k-th component lowers held-out error.
+    paired = fold_table.pivot_table(index=['repeat', 'fold'], columns='components', values='cv_mse')
+    gains = -paired.diff(axis=1)
+    gain_se = (gains.groupby(level='repeat').std() / np.sqrt(folds)).mean()
+    summary['q2'] = 1 - summary['cv_mse'] / summary.loc[0, 'cv_mse']
+    summary['gain'] = gains.mean()
+    summary['gain_se'] = gain_se
+    summary['in_sample_mse'] = (1 - np.asarray(in_sample_r2)) * y_variance
+    summary['in_sample_r2'] = in_sample_r2
+    summary['cumulative_x_variance_share'] = x_share
+    candidates = summary.drop(index=0)
+    best = int(candidates['cv_mse'].idxmin())
+    threshold = candidates.loc[best, 'cv_mse'] + candidates.loc[best, 'cv_mse_se']
+    summary.attrs.update(best=best, one_se=int(candidates.index[candidates['cv_mse'] <= threshold].min()),
+                         one_se_threshold=float(threshold), best_at_limit=best == max_components,
+                         folds=folds, repeats=repeats, tasks=int(rows['task'].nunique()), rows=len(rows))
+    return summary, fold_table
+
+
+def plot_component_selection(summary, title):
+    """Held-out and in-sample error against the number of PLS components, log scale, with
+    the one-standard-error threshold and the two choices marked."""
+    import plotly.graph_objects as go
+
+    table = summary.drop(index=0)
+    a = summary.attrs
+    fig = go.Figure([
+        go.Scatter(x=table.index, y=table['cv_mse'], mode='lines+markers', name='held-out tasks (CV)',
+                   line=dict(color='#2a78d6', width=2), marker=dict(size=6),
+                   error_y=dict(type='data', array=table['cv_mse_se'], color='#2a78d6', thickness=1),
+                   hovertemplate='%{x} components<br>CV MSE %{y:.4g}<extra></extra>'),
+        go.Scatter(x=table.index, y=table['in_sample_mse'], mode='lines', name='in sample',
+                   line=dict(color=INK_SECONDARY, width=2, dash='dot'),
+                   hovertemplate='%{x} components<br>in-sample MSE %{y:.4g}<extra></extra>')])
+    fig.add_hline(y=a['one_se_threshold'], line=dict(color=BASELINE, width=1, dash='dash'),
+                  annotation_text='best + 1 SE', annotation_position='top right')
+    fig.add_vline(x=a['one_se'], line=dict(color=ZERO_LINE_COLOR, width=2),
+                  annotation_text=f"one-SE rule: {a['one_se']}", annotation_position='top left')
+    fig.add_vline(x=a['best'], line=dict(color=INK_SECONDARY, width=1, dash='dot'),
+                  annotation_text=f"lowest: {a['best']}", annotation_position='bottom right')
+    fig.update_layout(
+        template='plotly_white', height=520, paper_bgcolor=SURFACE_COLOR, plot_bgcolor=SURFACE_COLOR,
+        title=dict(text=title, font=dict(color=INK, size=16)),
+        font=dict(family='system-ui, -apple-system, "Segoe UI", sans-serif', color=INK_SECONDARY),
+        margin=dict(l=16, r=16, t=64, b=16), legend=dict(orientation='h', yanchor='top', y=-0.14, x=0),
+        xaxis=dict(title='PLS components', gridcolor=GRID, zeroline=False, dtick=2),
+        yaxis=dict(title=f'weighted MSE of {TARGET} (log)', type='log', gridcolor=GRID, zeroline=False))
+    return fig
+
+
 @dataclass
 class ShapeFit:
     config: object
@@ -236,6 +370,8 @@ class ShapeFit:
     pls: WeightedPls
     shape: object               # gs.ConvexSurface or gs.TensorSpline, in all PLS components
     diagnostics: pd.Series
+    check_activations: np.ndarray  # a few raw rows kept for the reload check in `save_shape`
+    check_positions: np.ndarray
 
 
 def _start(scores, arc, weight, settings):
@@ -250,6 +386,9 @@ def fit_shape(run_dir, settings=None, progress=None):
     """
     s = settings or SurfaceSettings()
     config, _, rows, pls, X = fit_pls(run_dir, s)
+    rng = np.random.default_rng(s.seed)
+    check_positions = np.sort(rng.choice(len(rows), min(len(rows), s.reload_check_rows), replace=False))
+    check_activations = X[check_positions].copy()
     del X
     scores = rows[[f'PLS{i}' for i in range(1, s.pls_components + 1)]].to_numpy()
     arc, weight = rows[TARGET].to_numpy(), rows['pls_fit_weight'].to_numpy()
@@ -257,7 +396,98 @@ def fit_shape(run_dir, settings=None, progress=None):
                                                     s.surface, progress)
     rows['surface_s'], rows['surface_t'] = st[:, 0], st[:, 1]
     rows['surface_distance'] = np.sqrt(distance)
-    return ShapeFit(config, s, rows, pls, shape, pd.Series(diagnostics, name='geometric surface fit'))
+    return ShapeFit(config, s, rows, pls, shape, pd.Series(diagnostics, name='geometric surface fit'),
+                    check_activations, check_positions)
+
+
+def shape_dir(config):
+    return surface_dir(config) / 'shape'
+
+
+def _pls_arrays(pls, components):
+    return dict(pls_mean=pls.x_mean, pls_target_mean=np.asarray(pls.y_mean),
+                pls_rotations=pls.base_rotations, pls_weights=pls.weights, pls_loadings=pls.loadings,
+                pls_target_loadings=pls.target_loadings, pls_component_variances=pls.component_variances,
+                pls_component_names=np.asarray([f'PLS{i}' for i in range(1, components + 1)], dtype=str))
+
+
+def save_shape(result, notebook=None, plot_rows=8_000):
+    """Write a ShapeFit to pls/shape/: model.npz, model.json, rows.parquet and shape.html.
+
+    The saved model is reloaded before this returns: it must reproduce a sample of rows' PLS
+    scores from their raw activations, and the saved rows' surface points and distances.
+    Returns the folder.
+    """
+    config, s, pls, rows = result.config, result.settings, result.pls, result.rows
+    directory = shape_dir(config)
+    directory.mkdir(parents=True, exist_ok=True)
+    arrays = dict(**_pls_arrays(pls, s.pls_components), **result.shape.arrays('shape'))
+
+    def write_npz(path):
+        with path.open('wb') as stream:
+            np.savez_compressed(stream, **arrays)
+    _write(directory / 'model.npz', write_npz)
+    _write(directory / 'rows.parquet', lambda path: rows.to_parquet(path, engine='pyarrow', index=False))
+    figure = plot_shape(result, plot_rows)
+    _write(directory / 'shape.html',
+           lambda path: figure.write_html(path, include_plotlyjs=True, full_html=True))
+
+    metadata = dict(
+        schema_version=SHAPE_SCHEMA_VERSION, geometry_type=SHAPE_GEOMETRY_TYPE,
+        created_utc=datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        notebook=notebook, module='scripts/bcpc_surface.py',
+        model_name=config.model_name, layer_component=config.layer_component, position=config.position,
+        feature_count=int(len(pls.x_mean)), rows=int(len(rows)), fitting_rows='horizon_free',
+        excluded_templates=[] if s.include_excluded_templates else list(cv.EXCLUDED_TEMPLATES),
+        bcpc_excluded_templates=list(cv.EXCLUDED_TEMPLATES),
+        pls_target=TARGET, bcpc_bundle=_bundle_link(config), weighting=WEIGHTING,
+        settings=asdict(s),
+        pls_explained=dict(total_feature_variance=pls.total_x_variance,
+                           cumulative_x_variance_share=[float(v) for v in np.cumsum(pls.x_variance_share)],
+                           cumulative_weighted_training_r2=[float(v) for v in pls.cumulative_r2]),
+        shape_fit=json.loads(result.diagnostics.to_json()),
+        score_frame=f'unrotated PLS1-{s.pls_components}; no rescaling',
+        coordinate_meaning=dict(
+            surface_s='chart parameter of the closest point on the surface (working parameterisation)',
+            surface_t='chart parameter of the closest point on the surface (working parameterisation)',
+            surface_distance='distance from the row to its closest point, in PLS score units'),
+        transform=f'(X - pls_mean) @ pls_rotations, then the closest point on the shape '
+                  f'(geometric_surface.closest_points) in PLS1-{s.pls_components}',
+        files={name: _sha256(directory / name) for name in ('model.npz', 'rows.parquet', 'shape.html')},
+        code={name: _sha256(ROOT / name) for name in CODE_FILES},
+        runtime_versions=bcpc_bundle._runtime_versions())
+    _write(directory / 'model.json',
+           lambda path: path.write_text(json.dumps(metadata, indent=2), encoding='utf-8'))
+
+    arrays, _, shape = load_shape(config)
+    scores = (result.check_activations - arrays['pls_mean']) @ arrays['pls_rotations']
+    expected = rows.iloc[result.check_positions]
+    st = expected[['surface_s', 'surface_t']].to_numpy()
+    if not (np.allclose(scores, expected[list(arrays['pls_component_names'])].to_numpy(), rtol=0, atol=1e-8)
+            and np.array_equal(shape(st), result.shape(st))
+            and np.allclose(np.linalg.norm(scores - shape(st), axis=1), expected['surface_distance'],
+                            rtol=0, atol=1e-8)):
+        raise RuntimeError(f'The reloaded shape does not reproduce the saved rows in {directory}.')
+    return directory
+
+
+def load_shape(config):
+    """(arrays, metadata, shape) of the shape saved by `save_shape`; the shape takes PLS scores."""
+    directory = shape_dir(config)
+    metadata = json.loads((directory / 'model.json').read_text(encoding='utf-8'))
+    if (metadata.get('schema_version') != SHAPE_SCHEMA_VERSION
+            or metadata.get('geometry_type') != SHAPE_GEOMETRY_TYPE):
+        raise ValueError(f'Unsupported shape model in {directory}; refit it with '
+                         'notebooks/3_pls_arc_length_surface.ipynb.')
+    if _sha256(directory / 'model.npz') != metadata['files']['model.npz']:
+        raise ValueError(f'{directory / "model.npz"} does not match its metadata checksum.')
+    for key in ('model_name', 'layer_component', 'position'):
+        if metadata[key] != getattr(config, key):
+            raise ValueError(f'Shape/config {key} mismatch in {directory}.')
+    _check_bundle_link(config, metadata)
+    with np.load(directory / 'model.npz', allow_pickle=False) as archive:
+        arrays = {key: archive[key] for key in archive.files}
+    return arrays, metadata, gs.shape_from_arrays(arrays, 'shape')
 
 
 def fit_surface(run_dir, settings=None, progress=None):
@@ -332,12 +562,7 @@ def save(result, notebook=None):
     config, s, pls, rows = result.config, result.settings, result.pls, result.rows
     directory = surface_dir(config)
     directory.mkdir(parents=True, exist_ok=True)
-    arrays = dict(
-        pls_mean=pls.x_mean, pls_target_mean=np.asarray(pls.y_mean),
-        pls_rotations=pls.base_rotations, pls_weights=pls.weights, pls_loadings=pls.loadings,
-        pls_target_loadings=pls.target_loadings, pls_component_variances=pls.component_variances,
-        pls_component_names=np.asarray([f'PLS{i}' for i in range(1, s.pls_components + 1)], dtype=str),
-        **result.coordinates.arrays())
+    arrays = dict(**_pls_arrays(pls, s.pls_components), **result.coordinates.arrays())
 
     def write_npz(path):
         with path.open('wb') as stream:

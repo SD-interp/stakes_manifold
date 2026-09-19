@@ -2,7 +2,8 @@
 
 The pipeline runs in two halves. `InferenceDataset.cache` is the GPU half: it writes
 the prompts and one activation cache per template, and needs no surface. `project` is
-the CPU half: it reads those caches and maps them through the saved surface bundle.
+the CPU half: it reads those caches and maps them through the saved surface
+(`bcpc_surface.load_surface`, in `artifacts/<model>/pls/`).
 `run` is both, for a host that has the model and an exported surface at the same time.
 """
 import gc
@@ -15,8 +16,6 @@ import numpy as np
 import pandas as pd
 
 from . import cache_activations
-from .geometric_surface import OrthogonalCoordinates
-from .stakes_surface_bundle import load_surface_bundle
 
 COORDINATE_COLUMNS = ['arc_length_parallel', 'arc_length_orthogonal']
 
@@ -27,18 +26,17 @@ def _check_bundle(config, metadata):
             raise ValueError(f'Surface/config {key} mismatch.')
 
 
-def _map_scores(coordinates, pls_scores):
-    """Surface coordinates of PLS score rows, and whether each lies outside the fitted range.
+def _load_surface(config):
+    """The saved geometric surface of `config` (imported here: `bcpc_surface` imports this module)."""
+    from .bcpc_surface import load_surface
+    return load_surface(config)
 
-    The geometric surface (`bcpc_surface`) maps every PLS component; the legacy slice surface
-    maps PLS1-3 and is outside its range beyond its saved PLS3 heights.
-    """
-    if isinstance(coordinates, OrthogonalCoordinates):
-        mapped = coordinates.map_points(pls_scores[:, :coordinates.shape.dimension])
-        return mapped, mapped['coordinate_status'] != 'interior'
-    mapped = coordinates.map_points(pls_scores[:, :3], progress_seconds=None)
-    return mapped, ((pls_scores[:, 2] < coordinates.heights[0])
-                    | (pls_scores[:, 2] > coordinates.heights[-1]))
+
+def _map_scores(coordinates, pls_scores):
+    """Surface coordinates of PLS score rows, and whether each lies outside the fitted range
+    (its coordinate status is anything but interior)."""
+    mapped = coordinates.map_points(pls_scores[:, :coordinates.shape.dimension])
+    return mapped, mapped['coordinate_status'] != 'interior'
 
 
 def project_caches(config, records, paths, *, row_fields, csv_columns, bundle=None, scores=None):
@@ -48,7 +46,7 @@ def project_caches(config, records, paths, *, row_fields, csv_columns, bundle=No
     added beside the surface coordinates and checked finite with them.
     """
     import torch
-    arrays, metadata, coordinates = bundle or load_surface_bundle(config.surface_dir)
+    arrays, metadata, coordinates = bundle or _load_surface(config)
     _check_bundle(config, metadata)
     groups = cache_activations.template_groups(records)
     expected = {(tid, row): record for tid, group in groups.items() for row, record in enumerate(group)}
@@ -148,7 +146,7 @@ class InferenceDataset:
 
         Returns the CSV path, its rows and the projection diagnostics. No model, no
         fitting pipeline and no fitting inventory is involved; coordinates always come
-        from the bundle currently in `config.surface_dir`.
+        from the surface currently saved in `artifacts/<model>/pls/`.
         """
         records = self.build_records()
         directory = self.directory(config)
@@ -172,7 +170,7 @@ class InferenceDataset:
         The bundle is checked before any GPU work, so an absent or mismatched surface
         fails immediately instead of after the corpus has been cached.
         """
-        bundle = load_surface_bundle(config.surface_dir)
+        bundle = _load_surface(config)
         _check_bundle(config, bundle[1])
         self.cache(config, model, tokenizer, force=force)
         return self.project(config, bundle=bundle)

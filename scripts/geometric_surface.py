@@ -36,7 +36,7 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 from scipy.interpolate import BSpline, RectBivariateSpline, make_lsq_spline
-from scipy.linalg import cho_factor, cho_solve, solve_triangular
+from scipy.linalg import cho_solve, solve_triangular
 from scipy.optimize import nnls
 from scipy.spatial import ConvexHull, Delaunay, cKDTree
 
@@ -53,6 +53,9 @@ class SurfaceConfig:
     shape_model: str = 'convex'
     shape_knots: tuple = (6, 4)        # interior knots of the shape along s and t
     shape_bending: float = 1e-3        # bending-energy weight, relative to the data term
+    # Shape-fit weights grow by this share per RMS distance from the centroid (0 = unchanged;
+    # 0.2 gives a row at the RMS distance 1.2 times the weight of one at the centroid).
+    outer_weight: float = 0.0
     # 'convex': the chart box is the rows' extent in the principal plane, widened by this
     # share of its size on every side.
     box_padding: float = 0.02
@@ -92,6 +95,8 @@ class SurfaceConfig:
             raise ValueError('The Newton projection needs second derivatives: degree >= 2.')
         if self.shape_model not in SHAPE_MODELS:
             raise ValueError(f'shape_model must be one of {SHAPE_MODELS}.')
+        if self.outer_weight < 0:
+            raise ValueError('outer_weight must be >= 0.')
         if self.box_padding < 0 or self.convex_directions < 3 or self.convex_points < 1:
             raise ValueError('box_padding must be >= 0, convex_directions >= 3, convex_points >= 1.')
 
@@ -356,6 +361,48 @@ def closest_points(surface, points, start=None, config=None, search=True, bounds
     return st, value
 
 
+def global_closest_points(surface, points, config=None, candidates=4):
+    """`closest_points` from several starts, keeping each point's closest result.
+
+    The starts are the point's `candidates` best local minima of the squared distance over the
+    coarse search grid (fewer where the grid has fewer), so a point lying about equally close
+    to two parts of the surface settles on the closer one instead of on whichever basin the
+    single best grid node belongs to. Returns (st, squared distance).
+    """
+    c = config or SurfaceConfig()
+    points = np.asarray(points, float)
+    axis = np.linspace(0.0, 1.0, c.search_grid)
+    n = len(axis)
+    grid = np.stack(np.meshgrid(axis, axis, indexing='ij'), axis=-1).reshape(-1, 2)
+    grid_values = surface(grid)
+    grid_norms = (grid_values ** 2).sum(1)
+    starts = np.empty((len(points), candidates, 2))
+    for low in range(0, len(points), c.chunk_rows):
+        chunk = points[low:low + c.chunk_rows]
+        distance = (grid_norms[None, :] - 2 * chunk @ grid_values.T).reshape(-1, n, n)
+        padded = np.pad(distance, ((0, 0), (1, 1), (1, 1)), constant_values=np.inf)
+        local = np.ones(distance.shape, bool)
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                if di or dj:
+                    local &= distance <= padded[:, 1 + di:1 + di + n, 1 + dj:1 + dj + n]
+        score = np.where(local, distance, np.inf).reshape(len(chunk), -1)
+        best = np.argsort(score, axis=1)[:, :candidates]
+        best = np.where(np.isfinite(np.take_along_axis(score, best, 1)), best, best[:, :1])
+        starts[low:low + len(chunk)] = grid[best]
+    st, value = closest_points(surface, points, start=starts[:, 0], config=c, search=False)
+    for k in range(1, candidates):
+        other = np.any(starts[:, k] != starts[:, 0], axis=1)
+        if not other.any():
+            continue
+        trial_st, trial_value = closest_points(surface, points[other], start=starts[other, k], config=c,
+                                               search=False)
+        better = trial_value < value[other]
+        index = np.flatnonzero(other)[better]
+        st[index], value[index] = trial_st[better], trial_value[better]
+    return st, value
+
+
 def _newton_step(surface, points, st, value, damping, index, bounds=(0.0, 1.0), step_tolerance=1e-6):
     """One damped Newton step on the rows in `index`, updating `st`, `value` and `damping`
     in place. Returns, per row of `index`, whether it has converged."""
@@ -414,18 +461,23 @@ def fit_shape(points, weights, start=None, config=None, progress=None):
     starts from the rows' weighted principal plane and ignores it. Returns (surface, st,
     squared distances, diagnostics). `weights` are normalised to sum to one, so the data
     term is a weighted mean squared distance.
+
+    With `config.outer_weight` = a > 0 the fit uses `outer_weights`: each weight times
+    1 + a r / r_rms, r being the row's distance from the weighted centroid. The objective is
+    in those weights; the distance and variance diagnostics stay in the given ones.
     """
     c = config or SurfaceConfig()
     points = np.asarray(points, float)
     weights = np.asarray(weights, float) / np.sum(weights)
     if c.shape_model == 'bspline' and start is None:
         raise ValueError("A 'bspline' shape needs a starting chart.")
+    fitting = outer_weights(points, weights, c.outer_weight)
     fit = _fit_convex_shape if c.shape_model == 'convex' else _fit_bspline_shape
-    surface, st, penalty, history, plain_steps = fit(points, weights, start, c, progress)
+    surface, st, penalty, history, plain_steps = fit(points, fitting, start, c, progress)
     st, distance = closest_points(surface, points, start=st, config=c)
     coefficients = surface.coefficients.reshape(len(penalty), -1)
     bending = float(np.einsum('pd,pq,qd->', coefficients, penalty, coefficients))
-    history[-1] = float(weights @ distance + c.shape_bending * bending)
+    history[-1] = float(fitting @ distance + c.shape_bending * bending)
     centred = points - weights @ points
     extra = {}
     if isinstance(surface, ConvexSurface):
@@ -434,7 +486,9 @@ def fit_shape(points, weights, start=None, config=None, progress=None):
     diagnostics = dict(
         shape_model=c.shape_model, iterations=len(history), converged=len(history) < c.fit_iterations,
         plain_steps=plain_steps, objective=history[-1], objective_start=history[0],
-        bending_energy=bending,
+        bending_energy=bending, outer_weight=c.outer_weight,
+        # Mean square distance from the centroid under the fitting weights, relative to the given ones.
+        fit_weight_radius_ratio=float(fitting @ (centred ** 2).sum(1) / (weights @ (centred ** 2).sum(1))),
         weighted_rms_distance=float(np.sqrt(weights @ distance)),
         variance_share_on_surface=float(1 - weights @ distance / (weights @ (centred ** 2).sum(1))),
         rows_on_patch_boundary=int(on_boundary(st).sum()),
@@ -442,6 +496,20 @@ def fit_shape(points, weights, start=None, config=None, progress=None):
         **chart_regularity(surface),
         **convexity(surface), **extra)
     return surface, st, distance, diagnostics
+
+
+def outer_weights(points, weights, strength):
+    """`weights` times 1 + strength * r / r_rms, renormalised to sum to one.
+
+    r is each point's distance from the weighted centroid and r_rms its weighted RMS, so a
+    point at the typical distance gains `strength` relative to one at the centroid, and a
+    point twice as far gains twice that. Zero strength returns `weights` unchanged.
+    """
+    if strength == 0:
+        return weights
+    distance = np.linalg.norm(points - weights @ points, axis=1)
+    boosted = weights * (1 + strength * distance / np.sqrt(weights @ distance ** 2))
+    return boosted / boosted.sum()
 
 
 def _convexity_rows(shell, size, c):
@@ -915,6 +983,57 @@ class OrthogonalCoordinates:
             velocity, _ = self._flow(st)
             st = st + (level - self.u(st)[:, 0])[:, None] * velocity
         return st
+
+    def zero_curve_points(self, v):
+        """Chart points on the level curve u = u_zero at the given v (NaN beyond the traced curve)."""
+        v = np.asarray(v, float)
+        order = np.argsort(self.zero_v)
+        st = np.column_stack([np.interp(v, self.zero_v[order], self.zero_st[order, k]) for k in range(2)])
+        st = self._to_level(st, self.u_zero)
+        st[(v < self.zero_v.min()) | (v > self.zero_v.max())] = np.nan
+        return st
+
+    def length_lines(self, seeds, lengths, substeps=4):
+        """Chart points at signed surface lengths along the lines of constant v through `seeds`.
+
+        `seeds` lie on u = u_zero and `lengths` is increasing and holds 0 (the seeds); positive
+        lengths go towards larger u. Each line is integrated by RK4 in surface length,
+        d(s, t)/dl = g^-1 grad h / |grad h|, with `substeps` steps between consecutive lengths.
+        A line stops (NaN from there on) where it leaves the chart margin or where |grad u|
+        falls below the gradient floor. Returns (len(lengths), len(seeds), 2).
+        """
+        lengths, seeds = np.asarray(lengths, float), np.asarray(seeds, float)
+        zero = np.flatnonzero(lengths == 0)
+        if len(zero) != 1 or np.any(np.diff(lengths) <= 0):
+            raise ValueError('lengths must be increasing and hold 0 once.')
+        zero = int(zero[0])
+        lo, hi = -self.config.chart_margin, 1 + self.config.chart_margin
+
+        def velocity(st):
+            up, squared = self._gradient(st)
+            return up / np.sqrt(squared)[:, None]
+
+        out = np.full((len(lengths), len(seeds), 2), np.nan)
+        out[zero] = seeds
+        for indices in (range(zero + 1, len(lengths)), range(zero - 1, -1, -1)):
+            current, previous = seeds.copy(), 0.0
+            alive = np.all(np.isfinite(seeds), axis=1)
+            for i in indices:
+                h = (lengths[i] - previous) / substeps
+                with np.errstate(all='ignore'):
+                    for _ in range(substeps):
+                        k1 = velocity(current)
+                        k2 = velocity(current + h / 2 * k1)
+                        k3 = velocity(current + h / 2 * k2)
+                        k4 = velocity(current + h * k3)
+                        current = current + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+                    alive &= (np.all(np.isfinite(current) & (current >= lo) & (current <= hi), axis=1)
+                              & (self.gradient_norm(np.nan_to_num(current)) >= self.gradient_floor))
+                if not alive.any():
+                    break
+                out[i, alive] = current[alive]
+                previous = lengths[i]
+        return out
 
     def _v_on_zero_curve(self, st):
         """v of chart points lying on the level curve u = u_zero (segment projection)."""

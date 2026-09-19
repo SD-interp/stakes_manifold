@@ -118,10 +118,6 @@ class RunConfig:
         return self.run_dir / 'bcpc'
 
     @property
-    def surface_dir(self):
-        return self.run_dir / 'surface'
-
-    @property
     def plots_dir(self):
         return self.run_dir / 'plots'
 

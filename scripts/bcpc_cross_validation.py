@@ -468,7 +468,7 @@ def _score_traces(result, fit_label, max_rows, seed, legend):
     in-sample, the spline. Returns the traces, the rows drawn and the rows in the fit."""
     import plotly.graph_objects as go
 
-    from .stakes_surface_pipeline import INK, stakes_colors
+    from .plot_style import INK, stakes_colors
 
     frame = result.scores.loc[result.scores['fit'].eq(fit_label)].reset_index(drop=True)
     frame = frame.join(result.rows[['stakes', 'task', 'template', 'register']], on='row')
@@ -527,7 +527,7 @@ def plot_scores(results, max_rows=None, seed=42):
     spline on top and the held-out tasks below, each panel with its fits' spline anchors."""
     from plotly.subplots import make_subplots
 
-    from .stakes_surface_pipeline import BASELINE, GRID, INK, INK_SECONDARY, SURFACE_COLOR
+    from .plot_style import BASELINE, GRID, INK, INK_SECONDARY, SURFACE_COLOR
 
     names = list(results)
     fig = make_subplots(rows=len(FIT_CAPTIONS), cols=len(names),
@@ -565,7 +565,7 @@ def plot_scores(results, max_rows=None, seed=42):
 
 
 def _style_2d(fig, title, height=460):
-    from .stakes_surface_pipeline import BASELINE, GRID, INK, INK_SECONDARY, SURFACE_COLOR
+    from .plot_style import BASELINE, GRID, INK, INK_SECONDARY, SURFACE_COLOR
 
     fig.update_layout(
         template='plotly_white', height=height, paper_bgcolor=SURFACE_COLOR,
@@ -583,7 +583,7 @@ def plot_retention(results):
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
-    from .stakes_surface_pipeline import INK
+    from .plot_style import INK
 
     names = list(results)
     fig = make_subplots(rows=1, cols=len(names), shared_yaxes=True, subplot_titles=names,
@@ -617,7 +617,7 @@ def plot_refined(results):
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
-    from .stakes_surface_pipeline import INK, stakes_colors
+    from .plot_style import INK, stakes_colors
 
     names = list(results)
     colors = stakes_colors(LEVELS)

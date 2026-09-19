@@ -1,7 +1,6 @@
 import collections
 import copy
 from contextlib import contextmanager
-from dataclasses import asdict
 import hashlib
 import json
 import math
@@ -16,7 +15,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from scripts import (cache_activations, context_inference, inference_datasets,
+from scripts import (bcpc_surface, cache_activations, context_inference, inference_datasets,
                      pipeline_config, severity_composition_inference,
                      severity_flipped_inference,
                      severity_inference, severity_length_inference,
@@ -34,29 +33,51 @@ from scripts.corpora.inference import (context_prompts, rating_phrasings,
 from scripts.cache_inventory import CacheInventory
 from scripts.corpora.inference.severity_prompts import TEMPLATES, build_prompt_records
 from scripts.pipeline_config import RunConfig, NO_TIME_CORPORA
-from scripts.stakes_height_slices import SliceConfig, SliceSurface
-from scripts.stakes_surface_bundle import load_surface_bundle
+from scripts import geometric_surface as gs
 
 
 class SeverityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        """A small geometric surface in a 3-D PLS space, fitted once and saved by every setUp.
+
+        The mock activations are (len(text) / 10, 0.5, len(text) % 7 - 3). The surface covers
+        only 4 <= len(text) / 10 <= 14, so every corpus has rows off the fitted patch, and
+        u = len(text) / 10.
+        """
+        rng = np.random.default_rng(0)
+        x, z = rng.uniform(4, 14, 600), rng.uniform(-3, 3, 600)
+        points = np.column_stack([x, 0.5 + 0.02 * rng.normal(size=600), z])
+        weights = np.full(len(points), 1 / len(points))
+        config = gs.SurfaceConfig(shape_knots=(2, 2), u_knots=(2, 2), search_grid=33,
+                                  grid_points=33, net_points=(17, 17))
+        shape, st, _, _ = gs.fit_shape(points, weights, None, config)
+        coordinates = gs.OrthogonalCoordinates.build(shape, gs.fit_scalar(st, x, weights, config), 9.0,
+                                                     points.mean(0), st, weights, config)
+        cls.surface_arrays, cls.surface_config = coordinates.arrays(), coordinates.config_dict()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.config = RunConfig(artifact_root=Path(self.temp.name), device='cpu', batch_size=2)
         self.records = build_prompt_records()
         self.directory = self.config.run_dir / 'inference' / 'severity'
-        surface = SliceSurface([0, 0], [1, 1], np.zeros((4, 4)), [-2, 2], [-1, 1],
-                               0, SliceConfig(n_slices=5))
-        surface.build_cache(np.array([-1., 1.]))
-        self.config.surface_dir.mkdir(parents=True)
-        arrays = dict(pls_mean=np.zeros(3), pls_rotations=np.eye(3), **surface.arrays())
-        archive = self.config.surface_dir / 'model.npz'
+        # The surface is tied by checksum to the BCPC bundle it was fitted on.
+        self.config.bcpc_dir.mkdir(parents=True)
+        (self.config.bcpc_dir / 'model.json').write_text('{}')
+        (self.config.bcpc_dir / 'rows.parquet').write_bytes(b'rows')
+        self.surface_dir = bcpc_surface.surface_dir(self.config)
+        self.surface_dir.mkdir(parents=True)
+        arrays = dict(pls_mean=np.zeros(3), pls_rotations=np.eye(3),
+                      pls_component_names=np.array(['PLS1', 'PLS2', 'PLS3']), **self.surface_arrays)
+        archive = self.surface_dir / 'model.npz'
         np.savez_compressed(archive, **arrays)
-        metadata = dict(schema_version=2, geometry_type='pls2_cubic_height_slices',
+        metadata = dict(schema_version=bcpc_surface.SCHEMA_VERSION, geometry_type=bcpc_surface.GEOMETRY_TYPE,
                         model_name=self.config.model_name, layer_component=self.config.layer_component,
-                        position=-1, feature_count=3, slice_config=asdict(surface.config),
-                        model_sha256=hashlib.sha256(archive.read_bytes()).hexdigest())
-        (self.config.surface_dir / 'model.json').write_text(json.dumps(metadata))
+                        position=-1, feature_count=3, surface_config=self.surface_config,
+                        bcpc_bundle=bcpc_surface._bundle_link(self.config),
+                        files={'model.npz': hashlib.sha256(archive.read_bytes()).hexdigest()})
+        (self.surface_dir / 'model.json').write_text(json.dumps(metadata))
 
     @contextmanager
     def mock_model(self):
@@ -129,7 +150,7 @@ class SeverityTests(unittest.TestCase):
 
     def test_caching_notebook_is_the_only_gpu_half(self):
         """Part one loads each model once, caches everything, and fits nothing."""
-        code = self.notebook_code('arc_length_cache.ipynb')
+        code = self.notebook_code('1_arc_length_cache.ipynb')
         self.assertEqual(code.count('cache_activations.load_model('), 1)
         for stage in ('save_run_config(config, force=FORCE)',
                       'cache_activations.run(config, datasets',
@@ -140,27 +161,9 @@ class SeverityTests(unittest.TestCase):
         # The settings manifest is written before any weights are downloaded.
         self.assertLess(code.index('save_run_config('), code.index('load_model('))
         # Nothing here fits, projects or exports a coordinate.
-        for absent in ('StakesSurfacePipeline', '.project(', 'stated_stakes.export',
-                       'load_surface_bundle', '_arc_lengths.csv'):
+        for absent in ('bcpc_surface', 'bcpc_bundle', '.project(', 'stated_stakes.export',
+                       'load_surface', '_arc_lengths.csv'):
             self.assertNotIn(absent, code)
-
-    def test_surface_notebook_is_the_only_cpu_half(self):
-        """Part two reads caches only: no loader, no GPU, no Hugging Face."""
-        code = self.notebook_code('arc_length_surface.ipynb')
-        for stage in ('load_run_config(run_dir)', 'StakesSurfacePipeline(config)',
-                      'dataset.project(config)', 'stated_stakes.export_all(config, rated)',
-                      "pipeline.export(notebook='notebooks/arc_length_surface.ipynb')"):
-            self.assertIn(stage, code)
-        # Projection happens against an exported surface, never before one.
-        self.assertLess(code.index('pipeline.export('), code.index('dataset.project('))
-        for absent in ('load_model', 'cache_activations.run', 'dataset.cache(',
-                       'stated_stakes.cache(', 'stated_stakes.cache_all',
-                       'import torch', 'torch.cuda', 'transformers', 'FORCE'):
-            self.assertNotIn(absent, code)
-        # Each half names the other, so neither can be run out of order by accident.
-        self.assertIn('arc_length_cache.ipynb', code)
-        self.assertIn('arc_length_surface.ipynb',
-                      self.notebook_code('arc_length_cache.ipynb'))
 
     def test_both_halves_agree_on_the_run_settings(self):
         """The manifest round-trips every setting the analysis half must reuse."""
@@ -207,8 +210,8 @@ class SeverityTests(unittest.TestCase):
             combined_csv.unlink()
 
             # The GPU half again, this time with no surface in sight.
-            surface = {path: path.read_bytes() for path in self.config.surface_dir.iterdir()}
-            for path in self.config.surface_dir.iterdir():
+            surface = {path: path.read_bytes() for path in self.surface_dir.iterdir()}
+            for path in self.surface_dir.iterdir():
                 path.unlink()
             paths = dataset.cache(self.config, model, tokenize)
             loader.assert_not_called()
@@ -328,7 +331,7 @@ class SeverityTests(unittest.TestCase):
                 context_prompts.build_prompt_records()
 
     def test_context_inference_is_isolated_reusable_and_aligned(self):
-        before = {path.name: path.read_bytes() for path in self.config.surface_dir.iterdir()}
+        before = {path.name: path.read_bytes() for path in self.surface_dir.iterdir()}
         records = context_prompts.build_prompt_records()
         directory = self.config.run_dir / 'inference' / 'context'
         with self.mock_model() as (loader, tokenize, model):
@@ -345,7 +348,7 @@ class SeverityTests(unittest.TestCase):
                                            for path in cache_times})
 
         self.assertEqual(before, {path.name: path.read_bytes()
-                                  for path in self.config.surface_dir.iterdir()})
+                                  for path in self.surface_dir.iterdir()})
         self.assertEqual(csv, directory / 'context_arc_lengths.csv')
         self.assertEqual(list(pd.read_csv(csv).columns), context_inference.CSV_COLUMNS)
         self.assertEqual(result.task.tolist(), [record['task'] for record in records])
@@ -354,12 +357,9 @@ class SeverityTests(unittest.TestCase):
         self.assertEqual(result.context_position.tolist(),
                          [record['task_metadata']['context_position'] for record in records])
         self.assertEqual(result.prompt.tolist(), [record['text'] for record in records])
-        arrays, _, coordinates = load_surface_bundle(self.config.surface_dir)
+        arrays, _, coordinates = bcpc_surface.load_surface(self.config)
         X = tokenize([record['text'] for record in records])['input_ids'].float().double().numpy()
-        expected = coordinates.map_points(
-            ((X - arrays['pls_mean']) @ arrays['pls_rotations'])[:, :3],
-            progress_seconds=None,
-        )
+        expected = coordinates.map_points((X - arrays['pls_mean']) @ arrays['pls_rotations'])
         for column in context_inference.CSV_COLUMNS[-2:]:
             np.testing.assert_allclose(result[column], expected[column])
         paths = sorted(cache_times, reverse=True)
@@ -1246,7 +1246,7 @@ class SeverityTests(unittest.TestCase):
             severity_wording_prompts.build_prompt_records()
 
     def test_both_datasets_stay_separate_and_wording_projects_correctly(self):
-        before = {p.name: p.read_bytes() for p in self.config.surface_dir.iterdir()}
+        before = {p.name: p.read_bytes() for p in self.surface_dir.iterdir()}
         records = severity_wording_prompts.build_prompt_records()
         directory = self.config.run_dir / 'inference' / 'severity_wording'
         training = self.as_training_records(self.records[:2])
@@ -1271,7 +1271,7 @@ class SeverityTests(unittest.TestCase):
                 cache_activations.run_inference(self.config, changed, directory / 'activations',
                                                 model, tokenize,
                                                 namespace='severity_wording_inference')
-        self.assertEqual(before, {p.name: p.read_bytes() for p in self.config.surface_dir.iterdir()})
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.surface_dir.iterdir()})
         self.assertEqual(list(pd.read_csv(csv).columns), severity_wording_inference.CSV_COLUMNS)
         self.assertEqual(list(pd.read_csv(original_csv).columns), severity_inference.CSV_COLUMNS)
         self.assertEqual(len(original), len(self.records))
@@ -1279,9 +1279,9 @@ class SeverityTests(unittest.TestCase):
         self.assertEqual(result.task.tolist(), [r['task'] for r in records])
         self.assertEqual(result.prompt.tolist(), [r['text'] for r in records])
         self.assertTrue(diagnostics.outside_saved_height_range.any())
-        arrays, _, coordinates = load_surface_bundle(self.config.surface_dir)
+        arrays, _, coordinates = bcpc_surface.load_surface(self.config)
         X = tokenize([r['text'] for r in records])['input_ids'].float().double().numpy()
-        expected = coordinates.map_points(((X - arrays['pls_mean']) @ arrays['pls_rotations'])[:, :3], progress_seconds=None)
+        expected = coordinates.map_points((X - arrays['pls_mean']) @ arrays['pls_rotations'])
         for column in severity_wording_inference.CSV_COLUMNS[2:]:
             np.testing.assert_allclose(result[column], expected[column])
         reversed_paths = sorted(cache_times, reverse=True)
@@ -1297,7 +1297,7 @@ class SeverityTests(unittest.TestCase):
             self.assertTrue(all('severity' not in key for key in inventory.entries))
 
     def test_flipped_inference_is_isolated_aligned_and_uses_frozen_bundle(self):
-        before = {path.name: path.read_bytes() for path in self.config.surface_dir.iterdir()}
+        before = {path.name: path.read_bytes() for path in self.surface_dir.iterdir()}
         records = severity_flipped_prompts.build_prompt_records()
         directory = self.config.run_dir / 'inference' / 'severity_flipped'
         with self.mock_model() as (loader, tokenize, model):
@@ -1314,7 +1314,7 @@ class SeverityTests(unittest.TestCase):
                          [record['task_metadata']['severity_word'] for record in records])
         self.assertTrue(diagnostics.outside_saved_height_range.any())
         self.assertEqual(before, {path.name: path.read_bytes()
-                                  for path in self.config.surface_dir.iterdir()})
+                                  for path in self.surface_dir.iterdir()})
 
         paths = sorted((directory / 'activations').glob('*.pt'), reverse=True)
         self.assertEqual(len(paths), len(severity_flipped_prompts.TEMPLATES))
@@ -1326,11 +1326,9 @@ class SeverityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Missing'):
             severity_flipped_inference.project_caches(self.config, records, paths[:-1])
 
-        arrays, _, coordinates = load_surface_bundle(self.config.surface_dir)
+        arrays, _, coordinates = bcpc_surface.load_surface(self.config)
         X = tokenize([record['text'] for record in records])['input_ids'].float().double().numpy()
-        expected = coordinates.map_points(
-            ((X - arrays['pls_mean']) @ arrays['pls_rotations'])[:, :3],
-            progress_seconds=None)
+        expected = coordinates.map_points((X - arrays['pls_mean']) @ arrays['pls_rotations'])
         for column in severity_flipped_inference.CSV_COLUMNS[2:]:
             np.testing.assert_allclose(result[column], expected[column])
 
@@ -1355,7 +1353,7 @@ class SeverityTests(unittest.TestCase):
         self.assertNotIn('use_container_width', app)
 
     def test_pairwise_inference_is_isolated_reusable_and_aligned(self):
-        before = {path.name: path.read_bytes() for path in self.config.surface_dir.iterdir()}
+        before = {path.name: path.read_bytes() for path in self.surface_dir.iterdir()}
         records = severity_pairwise_prompts.build_prompt_records()
         directory = self.config.run_dir / 'inference' / 'severity_pairwise'
         with self.mock_model() as (loader, tokenize, model):
@@ -1371,7 +1369,7 @@ class SeverityTests(unittest.TestCase):
                          [record['task_metadata']['severity_word'] for record in records])
         self.assertTrue(diagnostics.outside_saved_height_range.any())
         self.assertEqual(before, {path.name: path.read_bytes()
-                                  for path in self.config.surface_dir.iterdir()})
+                                  for path in self.surface_dir.iterdir()})
 
         paths = sorted((directory / 'activations').glob('*.pt'), reverse=True)
         self.assertEqual(len(paths), len(severity_pairwise_prompts.TEMPLATES))
@@ -1382,11 +1380,9 @@ class SeverityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Missing'):
             severity_pairwise_inference.project_caches(self.config, records, paths[:-1])
 
-        arrays, _, coordinates = load_surface_bundle(self.config.surface_dir)
+        arrays, _, coordinates = bcpc_surface.load_surface(self.config)
         X = tokenize([record['text'] for record in records])['input_ids'].float().double().numpy()
-        expected = coordinates.map_points(
-            ((X - arrays['pls_mean']) @ arrays['pls_rotations'])[:, :3],
-            progress_seconds=None)
+        expected = coordinates.map_points((X - arrays['pls_mean']) @ arrays['pls_rotations'])
         for column in severity_pairwise_inference.CSV_COLUMNS[2:]:
             np.testing.assert_allclose(result[column], expected[column])
 
@@ -1398,7 +1394,7 @@ class SeverityTests(unittest.TestCase):
                 namespace='severity_pairwise_inference')
 
     def test_end_to_end_reuse_alignment_and_frozen_bundle(self):
-        before = {p.name: p.read_bytes() for p in self.config.surface_dir.iterdir()}
+        before = {p.name: p.read_bytes() for p in self.surface_dir.iterdir()}
         with self.mock_model() as (loader, tokenize, model):
             csv, result, diagnostics = severity_inference.run(self.config, model, tokenize)
             loader.assert_not_called()
@@ -1409,10 +1405,10 @@ class SeverityTests(unittest.TestCase):
         self.assertTrue(diagnostics.outside_saved_height_range.any())
         self.assertFalse(list(self.config.activations_dir.rglob('*.pt')))
         self.assertNotIn('severity_inference', NO_TIME_CORPORA)
-        self.assertEqual(before, {p.name: p.read_bytes() for p in self.config.surface_dir.iterdir()})
-        arrays, metadata, coordinates = load_surface_bundle(self.config.surface_dir)
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.surface_dir.iterdir()})
+        arrays, metadata, coordinates = bcpc_surface.load_surface(self.config)
         X = tokenize([r['text'] for r in self.records])['input_ids'].float().double().numpy()
-        expected = coordinates.map_points(((X - arrays['pls_mean']) @ arrays['pls_rotations'])[:, :3], progress_seconds=None)
+        expected = coordinates.map_points((X - arrays['pls_mean']) @ arrays['pls_rotations'])
         for column in severity_inference.CSV_COLUMNS[2:]:
             np.testing.assert_allclose(result[column], expected[column])
         paths = sorted((self.directory / 'activations').glob('*.pt'), reverse=True)
@@ -1435,7 +1431,7 @@ class SeverityTests(unittest.TestCase):
                                             self.config.activations_dir / 'inference', object(), object())
         with self.assertRaisesRegex(ValueError, 'horizon-free'):
             cache_activations.run(self.config, {'severity_inference': self.records}, object(), object())
-        arrays, metadata, coordinates = load_surface_bundle(self.config.surface_dir)
+        arrays, metadata, coordinates = bcpc_surface.load_surface(self.config)
         metadata['model_name'] = 'different-model'
         with self.assertRaisesRegex(ValueError, 'mismatch'):
             severity_inference.project_caches(self.config, self.records, [], (arrays, metadata, coordinates))

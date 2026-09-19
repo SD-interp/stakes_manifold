@@ -5,8 +5,13 @@ from .weighted_pls_statistics import WeightedStatistics
 
 
 def pls1_gram(C, s, n_components):
-    """Single-target PLS with regression deflation, from cross-products alone."""
-    C = np.array(C, dtype=np.float64, copy=True)
+    """Single-target PLS with regression deflation, from cross-products alone.
+
+    Regression deflation takes C_(k+1) = C_k - v_k p_k p_k' (v_k the score variance, p_k the
+    loading), so C_k = C - P D P' with D = diag(v). C_k is only ever needed times the new
+    weight vector, so it is never formed: each component costs one product with C.
+    """
+    C = np.asarray(C, dtype=np.float64)
     s = np.array(s, dtype=np.float64, copy=True)
     features = C.shape[0]
     if C.shape != (features, features) or s.shape != (features,):
@@ -18,23 +23,23 @@ def pls1_gram(C, s, n_components):
     weights = np.zeros((features, n_components))
     loadings = np.zeros_like(weights)
     target_loadings = np.zeros(n_components)
+    score_variances = np.zeros(n_components)
     for component in range(n_components):
         norm = np.linalg.norm(s)
         if not np.isfinite(norm) or norm <= 0:
             raise RuntimeError(f'Cross-covariance vanished before component {component + 1}.')
         w = s / norm
-        score_variance = float(w @ C @ w)
+        previous = loadings[:, :component]
+        Cw = C @ w - previous @ (score_variances[:component] * (previous.T @ w))   # C_k w
+        score_variance = float(w @ Cw)
         if not np.isfinite(score_variance) or score_variance <= 0:
             raise RuntimeError(f'Component {component + 1} has nonpositive score variance.')
-        Cw = C @ w
         covariance = float(w @ s)
         loading = Cw / score_variance
         weights[:, component] = w
         loadings[:, component] = loading
         target_loadings[component] = covariance / score_variance
-        C = (C - np.outer(loading, Cw) - np.outer(Cw, loading)
-             + score_variance * np.outer(loading, loading))
-        C = (C + C.T) * 0.5
+        score_variances[component] = score_variance
         s = s - loading * covariance
     return weights, loadings, target_loadings
 

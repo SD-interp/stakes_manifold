@@ -1,50 +1,63 @@
-# Arc-coordinate pipeline
+# Stakes geometry pipeline
 
-Compute `arc_length_parallel` and `arc_length_orthogonal` for horizon-free task prompts.
-The orthogonal column is the existing name for PLS3 height relative to zero; parallel
-length is signed slice length.
+Find the stakes geometry of horizon-free task prompts in a model's activations, and use it to
+refine the hand-assigned stakes labels. A between-class PCA (BCPC) and an arc-length spline
+through it give each prompt a continuous `bcpc_arc_length` and `refined_stakes`. A smooth
+geometric surface in PLS space then carries (u, v) coordinates tied to that arc length:
+`arc_length_parallel` is signed surface length along a line of constant v from
+`refined_stakes = 1`, and `arc_length_orthogonal` (`surface_v`) is surface length across it.
+The stakes labels are used inside the BCPC fit only; nothing downstream of it reads them.
 
 ## Run
 
-The pipeline runs in two passes, so the expensive half is paid for once.
+The pipeline runs in three notebooks. The first is the expensive GPU half, paid for once.
 
 ```powershell
 python -m pip install -r requirements.txt
-python -m jupyterlab notebooks/arc_length_cache.ipynb    # 1. GPU
-python -m jupyterlab notebooks/arc_length_surface.ipynb  # 2. CPU
+python -m jupyterlab notebooks/1_arc_length_cache.ipynb        # 1. GPU
+python -m jupyterlab notebooks/2_bcpc_out_of_fold.ipynb        # 2. CPU
+python -m jupyterlab notebooks/3_pls_arc_length_surface.ipynb  # 3. CPU
 ```
 
-**1. `notebooks/arc_length_cache.ipynb` needs a GPU.** For every model in its `MODELS` list it
-generates the prompt corpora, caches the layer outputs the surface is fitted from, caches the
+**1. `notebooks/1_arc_length_cache.ipynb` needs a GPU.** For every model in its `MODELS` list it
+generates the prompt corpora, caches the layer outputs everything is fitted from, caches the
 activations of every inference corpus, and generates the stated-stakes rating continuations.
 Each model is loaded exactly once and that instance serves every stage; no module in `scripts/`
 loads weights on its own. Its config cell selects the models, batch size, stakes class-merging
 dict, corpora, weights cache directory, rating corpora, and `FORCE`; the layer is
 `floor(0.6 * num_hidden_layers)` per model. It fits nothing and computes no coordinates.
 
-**2. `notebooks/arc_length_surface.ipynb` needs no GPU, no weights and no network.** For every
-model it finds under `ARTIFACT_ROOT` it fits the BCPC target, PLS, centroid-plane rotation and
-height-slice surface from the cached activations, exports and plots the surface, projects every
-cached inference corpus through it, and parses the cached rating continuations into CSVs. Each
-model describes itself through the `run_config.json` the caching pass wrote, so the layer,
-position, batch size and stakes merges are never retyped.
+**2. `notebooks/2_bcpc_out_of_fold.ipynb` needs no GPU, no weights and no network.** It fits
+the BCPC and the arc-length spline from the stakes classes, checks out of fold how much
+held-out stakes geometry they retain and how stable the refined stakes are, and saves the
+full-fit BCPC bundle (`bcpc_arc_length`, `refined_stakes`) that everything downstream uses.
 
-Everything runs and is stored locally; nothing is uploaded. The two passes can run on one
-machine or on two: to split them, copy `artifacts/<model name>/` off the GPU host. Changing a
-merge rule, a slice setting or a rating parse rule means re-running the second pass only.
+**3. `notebooks/3_pls_arc_length_surface.ipynb` needs no GPU either.** From the BCPC bundle's
+`bcpc_arc_length` it fits PLS and a smooth convex B-spline surface in PLS space by
+orthogonal-distance least squares, with per-model regularisation and outer-row weighting, and
+saves each surface.
+
+Each model describes itself through the `run_config.json` the caching pass wrote, so the
+layer, position, batch size and stakes merges are never retyped. Everything runs and is
+stored locally; nothing is uploaded. To split the passes across machines, copy
+`artifacts/<model name>/` off the GPU host.
 
 ## Artifacts
 
-Everything generated for a model lives under `artifacts/<model name>/`, e.g.
-`artifacts/Qwen3-4B-Instruct-2507/`:
+Everything generated for a model lives under `artifacts/<model name>/`:
 
-- `run_config.json` - the settings the caching pass used, which the analysis pass reads back
+- `run_config.json` - the settings the caching pass used, which the analysis passes read back
 - `datasets/` - prompt JSON per corpus
 - `activations/` - one `.pt` cache per corpus/template, preserving equal-file weights
-- `inference/<dataset>/` - `prompts.json`, `activations/`, `ratings/`, and the exported CSVs
-- `surface/` - `rows.parquet`, `model.npz`, `model.json`, and `slice_mapping_checkpoints/`
-- `plots/` - self-contained HTML figures: `bcpc_centroid_spline.html`,
-  `pls_centroid_splines.html`, `pls_surface.html`
+- `inference/<dataset>/` - `prompts.json`, `activations/`, `ratings/`, and exported CSVs
+- `bcpc/` - the full-fit BCPC bundle (`scripts/bcpc_bundle.py`): `model.npz`, `model.json`,
+  `rows.parquet` with every row's `bcpc_arc_length` and `refined_stakes`
+- `plots/` - the BCPC notebook's self-contained HTML figures
+- `pls/shape/` - the fitted surface alone (`bcpc_surface.save_shape`): `model.npz`,
+  `model.json`, `rows.parquet`, `shape.html`
+- `pls/` - the full surface with its u map and (u, v) coordinate tables
+  (`bcpc_surface.save`), and `pls/inference/<dataset>.csv`, every inference corpus mapped
+  through it (`bcpc_surface.project_inference`)
 
 Completed caches are fingerprint-checked before reuse; set `FORCE = True` to rebuild stale
 ones (for example after changing the layer). Compatible stated caches placed in
@@ -59,15 +72,17 @@ All logic is in `scripts/`; the notebooks only orchestrate.
 | `pipeline_config.py` | `RunConfig`: model, layer, batch size, stakes merges, artifact paths |
 | `prompt_datasets.py` | corpus generation and preflight checks |
 | `cache_activations.py` | model loading and per-template activation caching |
-| `inference_datasets.py` | ordered registry of the inference corpora both passes walk |
+| `inference_datasets.py` | ordered registry of the inference corpora |
 | `inference_projection.py` | the caching and projection halves of every inference corpus |
 | `stated_stakes.py` | rating continuations: generation on the GPU, parsing anywhere |
 | `cache_inventory.py` | cache inventory and checked batch reads |
 | `bcpc_arc_length.py` | between-class PCA and `bcpc_arc_length` |
-| `pls_fit.py` | weighted single-target PLS from streamed cross-products |
-| `stakes_surface_pipeline.py` | stage-by-stage fitting, mapping, export, and plots |
-| `stakes_height_slices.py` | height-slice surface geometry and validation |
-| `stakes_surface_bundle.py` | centroid splines and loading saved bundles |
+| `bcpc_cross_validation.py` | out-of-fold BCPC geometry and refined stakes |
+| `bcpc_bundle.py` | saving, loading and scoring with the full-fit BCPC bundle |
+| `pls_fit.py`, `weighted_pls_statistics.py` | weighted single-target PLS from streamed cross-products |
+| `geometric_surface.py` | the convex B-spline surface fit and its orthogonal (u, v) coordinates |
+| `bcpc_surface.py` | PLS and the surface from the BCPC bundle: fitting, saving, loading, plots |
+| `plot_style.py` | the shared Plotly palette |
 | `corpora/training/` | prompt templates and task sets the manifold is fitted on |
 | `corpora/inference/` | self-contained inference-only evaluation datasets |
 
@@ -79,8 +94,8 @@ prefix, via the loader, chat tokenizer, and temporary hooks in `utils/mech_inter
 
 The reference severity dataset has editable substitution lists in
 `scripts/corpora/inference/severity_prompts.py`. These prompts have no severity labels and never
-enter fitting or slice-grid construction. The caching pass caches their activations; after
-surface export, the analysis pass applies the frozen PLS transform and saved slice mapper.
+enter fitting. The caching pass caches their activations; once a surface is saved, projection
+applies its frozen PLS transform and maps each prompt onto the surface.
 
 Outputs live under `artifacts/<model name>/inference/severity/`: `prompts.json`,
 `activations/`, and `severity_arc_lengths.csv`. Keep these caches outside the main
@@ -89,9 +104,9 @@ Outputs live under `artifacts/<model name>/inference/severity/`: `prompts.json`,
 The CSV has exactly `template`, `severity_word`, `arc_length_parallel`, and
 `arc_length_orthogonal`; `template` is the unfilled sentence. Compatible activation
 caches are reused, while coordinates are recomputed against the current surface.
-Projection never loads a model. The analysis notebook reports projection
-diagnostics, including prompts outside saved height coverage, which snap to the nearest
-saved slice. `arc_length_orthogonal` retains its legacy meaning of snapped PLS3 height.
+Projection never loads a model. Its diagnostics flag prompts whose closest point lies
+off the fitted patch or whose u coordinate is invalid (`outside_saved_height_range`, kept
+under its legacy name).
 
 The counterfactual dataset in
 `scripts/corpora/inference/severity_flipped_prompts.py` preserves all 20 reference families,
@@ -106,7 +121,7 @@ Its independent outputs live under
 `severity_flipped_arc_lengths.csv`. The CSV schema matches the reference severity CSV.
 The cache namespace is `severity_flipped_inference`, so neither reference severity caches
 nor fitting caches can be reused accidentally. Projection uses the frozen saved bundle;
-these prompts never contribute to fitting or slice coverage.
+these prompts never contribute to fitting.
 
 The pairwise counterfactual dataset in
 `scripts/corpora/inference/severity_pairwise_prompts.py` selects one curated pair from each of
@@ -170,5 +185,5 @@ CSV columns are `task`, `setting`, `stakes_rank`, `context_axis`, `is_control`, 
 
 Every inference dataset shares the frozen projection and export logic in
 `scripts/inference_projection.py` and is listed once in `scripts/inference_datasets.py`, which
-both passes walk; none contributes to fitting or slice coverage, and each reuses only its own
+both passes walk; none contributes to fitting, and each reuses only its own
 caches.
