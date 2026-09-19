@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 from . import cache_activations
+from .geometric_surface import OrthogonalCoordinates
 from .stakes_surface_bundle import load_surface_bundle
 
 COORDINATE_COLUMNS = ['arc_length_parallel', 'arc_length_orthogonal']
@@ -24,6 +25,20 @@ def _check_bundle(config, metadata):
     for key in ('model_name', 'layer_component', 'position'):
         if metadata[key] != getattr(config, key):
             raise ValueError(f'Surface/config {key} mismatch.')
+
+
+def _map_scores(coordinates, pls_scores):
+    """Surface coordinates of PLS score rows, and whether each lies outside the fitted range.
+
+    The geometric surface (`bcpc_surface`) maps every PLS component; the legacy slice surface
+    maps PLS1-3 and is outside its range beyond its saved PLS3 heights.
+    """
+    if isinstance(coordinates, OrthogonalCoordinates):
+        mapped = coordinates.map_points(pls_scores[:, :coordinates.shape.dimension])
+        return mapped, mapped['coordinate_status'] != 'interior'
+    mapped = coordinates.map_points(pls_scores[:, :3], progress_seconds=None)
+    return mapped, ((pls_scores[:, 2] < coordinates.heights[0])
+                    | (pls_scores[:, 2] > coordinates.heights[-1]))
 
 
 def project_caches(config, records, paths, *, row_fields, csv_columns, bundle=None, scores=None):
@@ -60,8 +75,7 @@ def project_caches(config, records, paths, *, row_fields, csv_columns, bundle=No
             raise ValueError(f'Activation width/shape mismatch: {path}')
         X = tensor[:, 0, :].to(torch.float64).numpy()
         pls_scores = (X - arrays['pls_mean']) @ arrays['pls_rotations']
-        mapped = coordinates.map_points(pls_scores[:, :3], progress_seconds=None)
-        outside = (pls_scores[:, 2] < coordinates.heights[0]) | (pls_scores[:, 2] > coordinates.heights[-1])
+        mapped, outside = _map_scores(coordinates, pls_scores)
         extra = scores(X) if scores is not None else {}
         extra_columns = list(extra)
         template_ids = {r['template_id'] for r in rows}
